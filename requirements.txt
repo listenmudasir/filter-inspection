@@ -1,0 +1,25 @@
+# Production line dependency set. Verified 2026-09 on Ubuntu + RTX A5000.
+#
+# INSTALL TORCH FIRST, matched to your CUDA:
+#   pip install torch==2.5.1 torchvision==0.20.1 \
+#       --index-url https://download.pytorch.org/whl/cu121
+#
+# CPU-only works but the forward pass goes from ~45 ms to seconds and will NOT
+# meet the per-cartridge budget.
+
+# numpy MUST stay <2. opencv's C extension is built against the 1.x array ABI;
+# 2.x raises "_ARRAY_API not found".
+numpy<2
+
+# headless, NOT opencv-python. The non-headless wheel bundles its own Qt
+# plugins and sets QT_QPA_PLATFORM_PLUGIN_PATH at import, which hijacks PyQt5
+# and produces "could not load the Qt platform plugin xcb".
+opencv-python-headless
+
+PyQt5
+scipy
+PyYAML
+torch>=2.2
+torchvision>=0.17
+
+# NOT required: ultralytics (YOLO only), anomalib (superseded hybrid stack).

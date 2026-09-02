@@ -1,0 +1,1310 @@
+# -- coding: utf-8 --
+
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import QTimer, QObject, pyqtSignal, Qt
+from PyQt5.QtGui import QImage, QPixmap
+from CamOperation_class import CameraOperation
+from MvImport.MvCameraControl_class import *
+from MvImport.MvErrorDefine_const import *
+from MvImport.CameraParams_header import *
+from PyUICBasicDemo import Ui_MainWindow
+from hybrid_detect import load_model
+from tcp_server import start_tcp_server, get_tcp_server, stop_tcp_server
+import i18n
+import sys
+import numpy as np
+import cv2
+from CamOperation_class import set_ai_model, set_ai_parameters_func
+from shared_memory_sender import SharedMemorySender # 引入共享內存發送器
+from CamOperation_class import set_shared_memory_sender, set_auto_share
+from CamOperation_class import (
+    set_boundary_line_positions, 
+    get_boundary_line_positions, 
+    set_boundary_filter_enabled, 
+    is_boundary_filter_enabled
+)
+
+# --- 新增: 用於跨執行緒通訊的訊號發射器 ---
+class SignalEmitter(QObject):
+    original_image_ready = pyqtSignal(np.ndarray)
+    processed_image_ready = pyqtSignal(np.ndarray)
+    detection_results_ready = pyqtSignal(str)
+
+# --- 全域變數 ---
+# 請將此路徑替換為您自己的模型權重檔路徑
+import os as _os
+_DEPLOY = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                        "..", "filter-inspection")
+ai_model = load_model(_os.path.abspath(_DEPLOY))  # hybrid EfficientAD deployment checkout
+print("-----------------------------------Entry Yolo-Model-----7 class , material -------------------------")
+from CamOperation_class import set_ai_model
+set_ai_model(ai_model)
+
+# 新增全域變數用於控制 AI 檢測參數
+ai_conf_thres = 0.4  # 默認信心指數閾值
+ai_imgsz = 1280      # 默認影像大小
+
+def TxtWrapBy(start_str, end, all):
+    start = all.find(start_str)
+    if start >= 0:
+        start += len(start_str)
+        end = all.find(end, start)
+        if end >= 0:
+            return all[start:end].strip()
+
+def ToHexStr(num):
+    chaDic = {10: 'a', 11: 'b', 12: 'c', 13: 'd', 14: 'e', 15: 'f'}
+    hexStr = ""
+    if num < 0:
+        num = num + 2 ** 32
+    while num >= 16:
+        digit = num % 16
+        hexStr = chaDic.get(digit, str(digit)) + hexStr
+        num //= 16
+    hexStr = chaDic.get(num, str(num)) + hexStr
+    return hexStr
+
+if __name__ == "__main__":
+    # --- 全域變數 ---
+    deviceList = MV_CC_DEVICE_INFO_LIST()
+    cam = MvCamera()
+    nSelCamIndex = 0
+    obj_cam_operation = 0
+    isOpen = False
+    isGrabbing = False
+    isCalibMode = True
+    tcp_status_timer = None
+    signals = SignalEmitter() # 實例化訊號發射器
+    # 新增全局變量用於共享內存發送器
+    global global_sender
+    global_sender = None
+    global shared_trigger_count
+    shared_trigger_count = 0
+    # 配置共享內存的目標 (請根據您的接收端程式調整)
+    global RECEIVER_HOST
+    global RECEIVER_PORT
+    RECEIVER_HOST = '127.0.0.1' 
+    RECEIVER_PORT = 9999
+
+    def xFunc(event):
+        global nSelCamIndex
+        nSelCamIndex = TxtWrapBy("[", "]", ui.ComboDevices.get())
+
+    def enum_devices():
+        global deviceList
+        global obj_cam_operation
+
+        deviceList = MV_CC_DEVICE_INFO_LIST()
+        ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, deviceList)
+        if ret != 0:
+            strError = "Enum devices fail! ret = :" + ToHexStr(ret)
+            QMessageBox.warning(mainWindow, "Error", strError, QMessageBox.Ok)
+            return ret
+
+        if deviceList.nDeviceNum == 0:
+            QMessageBox.warning(mainWindow, "Info", "Find no device", QMessageBox.Ok)
+            return ret
+        print("Find %d devices!" % deviceList.nDeviceNum)
+
+        devList = []
+        for i in range(0, deviceList.nDeviceNum):
+            mvcc_dev_info = cast(deviceList.pDeviceInfo[i], POINTER(MV_CC_DEVICE_INFO)).contents
+            if mvcc_dev_info.nTLayerType == MV_GIGE_DEVICE:
+                chUserDefinedName = ""
+                for per in mvcc_dev_info.SpecialInfo.stGigEInfo.chUserDefinedName:
+                    if 0 == per:
+                        break
+                    chUserDefinedName += chr(per)
+                chModelName = ""
+                for per in mvcc_dev_info.SpecialInfo.stGigEInfo.chModelName:
+                    if 0 == per:
+                        break
+                    chModelName += chr(per)
+                nip1 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0xff000000) >> 24)
+                nip2 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x00ff0000) >> 16)
+                nip3 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x0000ff00) >> 8)
+                nip4 = (mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x000000ff)
+                devList.append(
+                    f"[{i}]GigE: {chUserDefinedName} {chModelName}({nip1}.{nip2}.{nip3}.{nip4})")
+            elif mvcc_dev_info.nTLayerType == MV_USB_DEVICE:
+                chUserDefinedName = ""
+                for per in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chUserDefinedName:
+                    if per == 0:
+                        break
+                    chUserDefinedName += chr(per)
+                chModelName = ""
+                for per in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chModelName:
+                    if 0 == per:
+                        break
+                    chModelName += chr(per)
+                strSerialNumber = ""
+                for per in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chSerialNumber:
+                    if per == 0:
+                        break
+                    strSerialNumber += chr(per)
+                devList.append(f"[{i}]USB: {chUserDefinedName} {chModelName}({strSerialNumber})")
+
+        ui.ComboDevices.clear()
+        ui.ComboDevices.addItems(devList)
+        ui.ComboDevices.setCurrentIndex(0)
+
+    def load_ai_model():
+        global ai_model
+        weight_path, _ = QFileDialog.getOpenFileName(mainWindow, "選擇 YOLO 權重檔", "", "PyTorch Weights (*.pt)")
+        if weight_path:
+            ai_model = load_model(weight_path)
+            if ai_model:
+                set_ai_model(ai_model)
+                QMessageBox.information(mainWindow, "AI 模型", "模型載入成功！")
+            else:
+                QMessageBox.warning(mainWindow, "AI 模型", "模型載入失敗！")
+
+    def update_ai_parameters():
+        """更新AI檢測參數"""
+        global ai_conf_thres, ai_imgsz
+        
+        try:
+            # 獲取信心指數閾值 (0.0 - 1.0)
+            conf_value = float(ui.edtConfThres.text())
+            if 0.0 <= conf_value <= 1.0:
+                ai_conf_thres = conf_value
+            else:
+                QMessageBox.warning(mainWindow, "參數錯誤", "信心指數必須介於 0.0 到 1.0 之間！")
+                ui.edtConfThres.setText(str(ai_conf_thres))
+                return
+            
+            # 獲取影像大小 (建議值: 320, 640, 1280)
+            imgsz_value = int(ui.edtImgSize.text())
+            if imgsz_value > 0 and imgsz_value % 32 == 0:  # YOLO要求是32的倍數
+                ai_imgsz = imgsz_value
+            else:
+                QMessageBox.warning(mainWindow, "參數錯誤", "影像大小必須是正數且為32的倍數！\n建議值: 320, 640, 1280")
+                ui.edtImgSize.setText(str(ai_imgsz))
+                return
+                
+            QMessageBox.information(mainWindow, "參數更新", 
+                f"AI檢測參數已更新：\n信心指數: {ai_conf_thres}\n影像大小: {ai_imgsz}")
+            
+            # 更新顯示的當前參數
+            update_ai_param_display()
+            
+        except ValueError:
+            QMessageBox.warning(mainWindow, "參數錯誤", "請輸入有效的數值！")
+
+    def reset_ai_parameters():
+        """重設AI檢測參數為預設值"""
+        global ai_conf_thres, ai_imgsz
+        ai_conf_thres = 0.4
+        ai_imgsz = 1280
+        ui.edtConfThres.setText(str(ai_conf_thres))
+        ui.edtImgSize.setText(str(ai_imgsz))
+        update_ai_param_display()
+        QMessageBox.information(mainWindow, "參數重設", "AI檢測參數已重設為預設值！")
+
+    def update_ai_param_display():
+        """更新顯示目前的AI參數"""
+        ui.lblCurrentParams.setText(i18n.tr_fmt(
+            "目前參數 - 信心指數: {conf}, 影像大小: {size}",
+            conf=ai_conf_thres, size=ai_imgsz))
+
+    def get_ai_parameters():
+        """供其他模組使用的函數，回傳目前的AI參數"""
+        return ai_conf_thres, ai_imgsz
+
+    def start_tcp_server_func():
+        """啟動TCP伺服器"""
+        try:
+            host = ui.edtTcpHost.text() if ui.edtTcpHost.text() else 'localhost'
+            port = int(ui.edtTcpPort.text()) if ui.edtTcpPort.text() else 8888
+            
+            if start_tcp_server(host, port):
+                QMessageBox.information(mainWindow, "TCP 伺服器", f"TCP伺服器已啟動\n位址: {host}:{port}\n等待 LabVIEW 連接...")
+                ui.bnStartTCP.setEnabled(False)
+                ui.bnStopTCP.setEnabled(True)
+                
+                global tcp_status_timer
+                if tcp_status_timer is None:
+                    tcp_status_timer = QTimer()
+                    tcp_status_timer.timeout.connect(update_tcp_status)
+                tcp_status_timer.start(1000)
+                
+            else:
+                QMessageBox.warning(mainWindow, "TCP 伺服器", "TCP伺服器啟動失敗！")
+        except Exception as e:
+            QMessageBox.warning(mainWindow, "TCP 伺服器", f"啟動失敗: {str(e)}")
+
+    def stop_tcp_server_func():
+        """停止TCP伺服器"""
+        try:
+            stop_tcp_server()
+            QMessageBox.information(mainWindow, "TCP 伺服器", "TCP伺服器已停止")
+            ui.bnStartTCP.setEnabled(True)
+            ui.bnStopTCP.setEnabled(False)
+            
+            global tcp_status_timer
+            if tcp_status_timer:
+                tcp_status_timer.stop()
+                
+            if hasattr(ui, 'lblTcpStatus'):
+                ui.lblTcpStatus.setText(i18n.tr("TCP: 未連接"))
+                
+        except Exception as e:
+            QMessageBox.warning(mainWindow, "TCP 伺服器", f"停止失敗: {str(e)}")
+
+    def update_tcp_status():
+        """更新TCP連接狀態"""
+        tcp_server = get_tcp_server()
+        if tcp_server and hasattr(ui, 'lblTcpStatus'):
+            status = tcp_server.get_connection_status()
+            if status['client_connected']:
+                ui.lblTcpStatus.setText(i18n.tr_fmt("TCP: LabVIEW已連接 (觸發次數: {count})", count=status["trigger_count"]))
+                ui.lblTcpStatus.setStyleSheet("color: green; font-weight: bold;")
+            elif status['server_running']:
+                ui.lblTcpStatus.setText(i18n.tr("TCP: 等待LabVIEW連接..."))
+                ui.lblTcpStatus.setStyleSheet("color: orange; font-weight: bold;")
+            else:
+                ui.lblTcpStatus.setText(i18n.tr("TCP: 伺服器未啟動"))
+                ui.lblTcpStatus.setStyleSheet("color: red; font-weight: bold;")
+
+    def update_shared_memory_ui():
+        """更新共享記憶體連接狀態"""
+        global global_sender, shared_trigger_count
+        
+        if global_sender is not None:
+            # 檢查 trigger_count 屬性
+            try:
+                count = getattr(global_sender, 'trigger_count', 0)
+                ui.lblSharedMemStatus.setText(i18n.tr_fmt("共享記憶體: 已啟動 (已傳送 {count} 幀)", count=count))
+                ui.lblSharedMemStatus.setStyleSheet("color: green; font-weight: bold;")
+            except Exception as e:
+                ui.lblSharedMemStatus.setText(i18n.tr("共享記憶體: 已啟動 (狀態未知)"))
+                ui.lblSharedMemStatus.setStyleSheet("color: orange; font-weight: bold;")
+        else:
+            ui.lblSharedMemStatus.setText(i18n.tr("共享記憶體: 未啟動"))
+            ui.lblSharedMemStatus.setStyleSheet("color: red; font-weight: bold;")
+
+    def start_shared_memory():
+       """啟動共享記憶體發送器"""
+       global global_sender, shared_trigger_count
+
+       try:
+           host = ui.edtSharedMemHost.text() or '127.0.0.1'
+           port = int(ui.edtSharedMemPort.text() or '9999')
+           print(f"嘗試連接到 {host}:{port}") 
+           if global_sender is None:
+               # 創建發送器實例
+               global_sender = SharedMemorySender(host, port)
+               if not global_sender.is_connected():
+                   QMessageBox.warning(mainWindow, "連接失敗", 
+                        "無法連接到接收端！\n請確認：\n"
+                        "1. 接收端程式 (receiver.py) 已啟動\n"
+                        "2. IP 和端口設置正確")
+                   global_sender = None
+                   return
+ 
+               # 初始化計數器
+               if not hasattr(global_sender, 'trigger_count'):
+                   global_sender.trigger_count = 0
+               shared_trigger_count = 0
+
+               # 將發送器設置到 CamOperation_class
+               set_shared_memory_sender(global_sender)
+
+               QMessageBox.information(mainWindow, "共享記憶體", 
+                   f"共享記憶體已啟動！\n\n"
+                   f"目標位址: {host}:{port}\n"
+                   f"請確保接收端程式 (receiver.py) 已在運行\n\n"
+                   f"提示: 可在「共享記憶體控制」頁籤中\n"
+                   f"啟用「自動分享」或使用「手動分享」")
+
+               ui.bnStartSharedMem.setEnabled(False)
+               ui.bnStopSharedMem.setEnabled(True)
+               ui.chkAutoShare.setEnabled(True)
+               ui.bnManualShare.setEnabled(True)
+
+               # 更新UI狀態
+               update_shared_memory_ui()
+           else:
+               QMessageBox.warning(mainWindow, "共享記憶體", "發送器已在運行中！")
+
+       except Exception as e:
+           QMessageBox.critical(mainWindow, "共享記憶體", f"啟動失敗:\n{str(e)}")
+           import traceback
+           traceback.print_exc()
+
+    def stop_shared_memory():
+        """停止共享記憶體發送器"""
+        global global_sender
+
+        try:
+            if global_sender is not None:
+                # 停用自動分享
+                set_auto_share(False)
+                ui.chkAutoShare.setChecked(False)
+
+                # 清除發送器引用
+                set_shared_memory_sender(None)
+
+                # 關閉連接
+                try:
+                    global_sender.close()
+                except Exception as e:
+                    print(f"關閉發送器時出錯: {e}")
+
+                global_sender = None
+
+                QMessageBox.information(mainWindow, "共享記憶體", "共享記憶體已停止")
+                ui.bnStartSharedMem.setEnabled(True)
+                ui.bnStopSharedMem.setEnabled(False)
+                ui.chkAutoShare.setEnabled(False)
+                ui.bnManualShare.setEnabled(False)
+
+                # 更新UI狀態
+                update_shared_memory_ui()
+            else:
+                QMessageBox.information(mainWindow, "共享記憶體", "共享記憶體未在運行")
+
+        except Exception as e:
+            QMessageBox.critical(mainWindow, "共享記憶體", f"停止失敗:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def toggle_auto_share():
+        """切換自動分享模式"""
+        global global_sender
+
+        enabled = ui.chkAutoShare.isChecked()
+
+        if enabled and global_sender is None:
+            QMessageBox.warning(mainWindow, "自動分享", "請先啟動共享記憶體！")
+            ui.chkAutoShare.setChecked(False)
+            return
+
+        if not isGrabbing:
+            QMessageBox.warning(mainWindow, "自動分享", "請先開始取像！")
+            ui.chkAutoShare.setChecked(False)
+            return
+
+        set_auto_share(enabled)
+
+        if enabled:
+            QMessageBox.information(mainWindow, "自動分享", 
+                "✅ 已啟用自動分享\n\n"
+                "每一幀圖像都會自動發送到共享記憶體\n"
+                "接收端可實時接收圖像數據")
+        else:
+            QMessageBox.information(mainWindow, "自動分享", 
+                "⏸ 已停用自動分享\n\n"
+                "可使用「手動分享」按鈕手動發送圖像")
+
+    def manual_share_current_frame():
+        """手動分享當前幀"""
+        global global_sender, shared_trigger_count
+
+        if not isGrabbing:
+            QMessageBox.warning(mainWindow, "錯誤", "請先開始取像！")
+            return
+
+        if global_sender is None:
+            QMessageBox.warning(mainWindow, "錯誤", "請先啟動共享記憶體！")
+            return
+
+        try:
+            # 調用原有的手動分享函數
+            transfer_image_and_flip()
+
+            # 獲取當前計數
+            count = getattr(global_sender, 'trigger_count', shared_trigger_count)
+
+            QMessageBox.information(mainWindow, "手動分享", 
+                f"✅ 已發送圖像\n\n"
+                f"觸發次數: {count}\n"
+                f"接收端應已收到數據")
+
+        except Exception as e:
+            QMessageBox.critical(mainWindow, "手動分享", f"發送失敗:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
+    def transfer_image_and_flip():
+        """
+        手動觸發：獲取當前幀，處理並共享
+        這個函數用於手動分享按鈕
+        """
+        global obj_cam_operation, global_sender, shared_trigger_count
+
+        if not isGrabbing or obj_cam_operation.buf_save_image is None:
+            raise Exception("相機未在取像或緩衝區為空")
+
+        try:
+            # 獲取緩衝區鎖，防止取圖線程同時寫入
+            obj_cam_operation.buf_lock.acquire() 
+
+            # 1. 從 C 緩衝區創建 NumPy 數組
+            st_info = obj_cam_operation.st_frame_info
+
+            if st_info is None:
+                raise Exception("幀信息為空")
+
+            # 創建原始圖像數組
+            raw_data = np.ctypeslib.as_array(
+                obj_cam_operation.buf_save_image, 
+                shape=(st_info.nHeight, st_info.nWidth)
+            )
+
+            # 複製數據
+            image_bayer = raw_data.copy()
+            obj_cam_operation.buf_lock.release()
+
+            # 2. 轉換圖像格式
+            if st_info.enPixelType == PixelType_Gvsp_BayerRG8:
+                image_bgr = cv2.cvtColor(image_bayer, cv2.COLOR_BAYER_RG2BGR)
+            elif st_info.enPixelType == PixelType_Gvsp_BayerGR8:
+                image_bgr = cv2.cvtColor(image_bayer, cv2.COLOR_BAYER_GR2BGR)
+            elif st_info.enPixelType == PixelType_Gvsp_BayerGB8:
+                image_bgr = cv2.cvtColor(image_bayer, cv2.COLOR_BAYER_GB2BGR)
+            elif st_info.enPixelType == PixelType_Gvsp_BayerBG8:
+                image_bgr = cv2.cvtColor(image_bayer, cv2.COLOR_BAYER_BG2BGR)
+            elif st_info.enPixelType == PixelType_Gvsp_Mono8:
+                image_bgr = cv2.cvtColor(image_bayer, cv2.COLOR_GRAY2BGR)
+            else:
+                raise Exception(f"不支援的像素格式: {st_info.enPixelType}")
+
+        except Exception as e:
+            # 確保在異常情況下釋放鎖
+            if obj_cam_operation.buf_lock.locked():
+                obj_cam_operation.buf_lock.release()
+            raise e
+
+        # 3. 圖像處理：
+        # 不執行翻轉操作
+        image_bgr = image_bgr
+
+        # 4. 發送到共享記憶體
+        shared_trigger_count += 1
+        global_sender.send_image(image_bgr, shared_trigger_count)
+
+        # 同步計數器
+        if hasattr(global_sender, 'trigger_count'):
+            global_sender.trigger_count = shared_trigger_count
+
+        print(f"[手動分享] 已發送圖像，觸發次數: {shared_trigger_count}")
+
+
+    def open_device():
+        global deviceList, nSelCamIndex, obj_cam_operation, isOpen
+        #共享記憶體全域變數
+        global global_sender
+        global shared_trigger_count # 確保可以訪問
+        
+        if isOpen:
+            QMessageBox.warning(mainWindow, "Error", 'Camera is Running!', QMessageBox.Ok)
+            return MV_E_CALLORDER
+        nSelCamIndex = ui.ComboDevices.currentIndex()
+        if nSelCamIndex < 0:
+            QMessageBox.warning(mainWindow, "Error", 'Please select a camera!', QMessageBox.Ok)
+            return MV_E_CALLORDER
+        obj_cam_operation = CameraOperation(cam, deviceList, nSelCamIndex)
+        ret = obj_cam_operation.Open_device()
+        if 0 != ret:
+            strError = "Open device failed ret:" + ToHexStr(ret)
+            QMessageBox.warning(mainWindow, "Error", strError, QMessageBox.Ok)
+            isOpen = False
+        else:
+            set_continue_mode()
+            get_param()
+            isOpen = True
+            enable_controls()
+
+    def start_grabbing():
+        global obj_cam_operation, isGrabbing, signals
+        # 修改: 傳送 signals 物件，而不是 winId
+        ret = obj_cam_operation.Start_grabbing(signals)
+        if ret != 0:
+            strError = "Start grabbing failed ret:" + ToHexStr(ret)
+            QMessageBox.warning(mainWindow, "Error", strError, QMessageBox.Ok)
+        else:
+            isGrabbing = True
+            enable_controls()
+
+    def stop_grabbing():
+        global obj_cam_operation, isGrabbing
+        ret = obj_cam_operation.Stop_grabbing()
+        if ret != 0:
+            strError = "Stop grabbing failed ret:" + ToHexStr(ret)
+            QMessageBox.warning(mainWindow, "Error", strError, QMessageBox.Ok)
+        else:
+            isGrabbing = False
+            enable_controls()
+
+    def close_device():
+        global isOpen, isGrabbing, obj_cam_operation
+        global obj_cam_operation
+        global global_sender # 確保可以訪問
+        if isGrabbing:
+            stop_grabbing()
+        if isOpen:
+            obj_cam_operation.Close_device()
+            isOpen = False
+        # **【新增邏輯】** 清理共享內存資源
+        if global_sender is not None:
+            global_sender.close()
+        isGrabbing = False
+        enable_controls()
+
+    def set_continue_mode():
+        ret = obj_cam_operation.Set_trigger_mode(False)
+        if ret == 0:
+            ui.radioContinueMode.setChecked(True)
+            ui.radioTriggerMode.setChecked(False)
+            ui.bnSoftwareTrigger.setEnabled(False)
+
+    def set_software_trigger_mode():
+        ret = obj_cam_operation.Set_trigger_mode(True)
+        if ret == 0:
+            ui.radioContinueMode.setChecked(False)
+            ui.radioTriggerMode.setChecked(True)
+            ui.bnSoftwareTrigger.setEnabled(isGrabbing)
+
+    def trigger_once():
+        ret = obj_cam_operation.Trigger_once()
+        if ret != 0:
+            QMessageBox.warning(mainWindow, "Error", "TriggerSoftware failed", QMessageBox.Ok)
+
+    def save_bmp():
+        ret = obj_cam_operation.Save_Bmp()
+        if ret != MV_OK:
+            QMessageBox.warning(mainWindow, "Error", "Save BMP failed", QMessageBox.Ok)
+
+    def get_param():
+        ret = obj_cam_operation.Get_parameter()
+        if ret == 0:
+            ui.edtExposureTime.setText(f"{obj_cam_operation.exposure_time:.2f}")
+            ui.edtGain.setText(f"{obj_cam_operation.gain:.2f}")
+            ui.edtFrameRate.setText(f"{obj_cam_operation.frame_rate:.2f}")
+
+    def set_param():
+        ret = obj_cam_operation.Set_parameter(ui.edtFrameRate.text(), ui.edtExposureTime.text(), ui.edtGain.text())
+        return ret
+
+    def select_save_path():
+        """選擇圖片儲存路徑"""
+        from PyQt5.QtWidgets import QFileDialog
+        from CamOperation_class import set_image_save_path
+        
+        path = QFileDialog.getExistingDirectory(mainWindow, "選擇圖片儲存資料夾", "")
+        if path:
+            set_image_save_path(path)
+            ui.lblSavePath.setText(path)
+            ui.lblSavePath.setStyleSheet("color: green; font-size: 9px; word-wrap: break-word;")
+            QMessageBox.information(mainWindow, "路徑設定", f"圖片儲存路徑已設定為：\n{path}")
+    
+    def toggle_image_save():
+        """切換圖片儲存功能"""
+        from CamOperation_class import set_image_save_enabled, get_image_save_settings
+        
+        enabled, path = get_image_save_settings()
+        
+        if ui.chkImageSaveEnabled.isChecked():
+            # 嘗試啟用
+            if not path:
+                QMessageBox.warning(mainWindow, "警告", "請先選擇儲存路徑！")
+                ui.chkImageSaveEnabled.setChecked(False)
+                return
+            
+            set_image_save_enabled(True)
+            ui.lblImageSaveStatus.setText(i18n.tr("儲存: 啟用"))
+            ui.lblImageSaveStatus.setStyleSheet("color: green; font-weight: bold; font-size: 10px;")
+            QMessageBox.information(
+                mainWindow, 
+                "圖片儲存已啟用", 
+                f"圖片將自動儲存至：\n{path}\n\n"
+                "檔案將按日期分類（格式：YYYYMMDD/image_YYYYMMDD_HHMMSS_mmm.jpg）"
+            )
+        else:
+            # 停用
+            set_image_save_enabled(False)
+            ui.lblImageSaveStatus.setText(i18n.tr("儲存: 停用"))
+            ui.lblImageSaveStatus.setStyleSheet("color: red; font-weight: bold; font-size: 10px;")
+
+    def enable_controls():
+        ui.groupGrab.setEnabled(isOpen)
+        ui.groupParam.setEnabled(isOpen)
+        ui.bnOpen.setEnabled(not isOpen)
+        ui.bnClose.setEnabled(isOpen)
+        ui.bnStart.setEnabled(isOpen and (not isGrabbing))
+        ui.bnStop.setEnabled(isOpen and isGrabbing)
+        ui.bnSoftwareTrigger.setEnabled(isGrabbing and ui.radioTriggerMode.isChecked())
+        ui.bnSaveImage.setEnabled(isOpen and isGrabbing)
+        # 共享記憶體控制
+        # 只有在取像且共享記憶體已啟動時才能手動分享
+        ui.bnManualShare.setEnabled(isOpen and isGrabbing and global_sender is not None)
+            # 自動分享只有在共享記憶體啟動時才能勾選
+        if global_sender is None:
+            ui.chkAutoShare.setEnabled(False)
+            ui.chkAutoShare.setChecked(False)
+        elif not isGrabbing:
+            # 如果停止取像，自動取消自動分享
+            if ui.chkAutoShare.isChecked():
+                ui.chkAutoShare.setChecked(False)
+                set_auto_share(False)
+
+    # --- 新增: 更新 UI 的槽函式 ---
+    def update_display(image_array, display_label):
+        """將 numpy array 轉換為 QPixmap 並顯示在 QLabel 上"""
+        try:
+            height, width, channel = image_array.shape
+            bytes_per_line = 3 * width
+            # 確保數據是連續的並正確複製
+            image_copy = np.ascontiguousarray(image_array)
+            
+            # 測試：打印第一個像素的顏色值來確認格式
+            print(f"First pixel RGB values: R={image_copy[0,0,0]}, G={image_copy[0,0,1]}, B={image_copy[0,0,2]}")
+            
+            # 創建 QImage 並使用 rgbSwapped() 來交換 R 和 B 通道（因為收到的是 BGR）
+            q_image = QImage(image_copy.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
+            q_image = q_image.rgbSwapped()  # BGR → RGB
+            
+            pixmap = QPixmap.fromImage(q_image)
+            display_label.setPixmap(pixmap.scaled(display_label.size(), aspectRatioMode=Qt.KeepAspectRatio, transformMode=Qt.SmoothTransformation))
+        except Exception as e:
+            print(f"Error updating display: {e}")
+
+    def update_original_display(image_array):
+        """更新「相機控制」頁面的原始影像"""
+        if ui.originalDisplayLabel.isVisible():
+            update_display(image_array, ui.originalDisplayLabel)
+
+    def update_processed_display(image_array):
+        """更新「TCP控制」頁面的辨識後影像"""
+        if ui.processedDisplayLabel.isVisible():
+            update_display(image_array, ui.processedDisplayLabel)
+
+    def update_detection_text(result_string):
+        """更新「TCP控制」頁面的辨識結果文字"""
+        ui.detectionResultText.setText(result_string)
+    # --- 主程式 ---
+    app = QApplication(sys.argv)
+    mainWindow = QMainWindow()
+    ui = Ui_MainWindow()
+    ui.setupUi(mainWindow)
+    mainWindow.setWindowTitle("工業相機 AI 檢測應用 V1.5.3")
+
+    # --- 修改 UI 佈局 ---
+    
+    # 1. 在「相機控制」頁面新增一個 QLabel 用於顯示原始影像
+    #    我們將它放在原本的 widgetDisplay 內部
+    ui.originalDisplayLabel = QLabel(ui.widgetDisplay)
+    ui.originalDisplayLabel.setObjectName("originalDisplayLabel")
+    ui.originalDisplayLabel.setText("相機影像將顯示於此")
+    ui.originalDisplayLabel.setAlignment(Qt.AlignCenter)
+    display_layout = QVBoxLayout(ui.widgetDisplay)
+    display_layout.addWidget(ui.originalDisplayLabel)
+
+    # 2. 建立新的 TCP 控制頁面佈局 (左右分割)
+    original_widget = mainWindow.centralWidget()
+    tabs = QTabWidget()
+    tabs.addTab(original_widget, "相機控制")
+
+    tcp_widget = QWidget()
+    main_tcp_layout = QHBoxLayout(tcp_widget)  # 改為水平佈局
+    
+    # =======================================
+    # 左側：辨識結果顯示區 (佔 60-70%)
+    # =======================================
+    left_panel = QWidget()
+    left_layout = QVBoxLayout(left_panel)
+    left_layout.setContentsMargins(5, 5, 5, 5)
+    
+    # 辨識影像顯示
+    detection_display_group = QGroupBox("模型辨識結果")
+    detection_display_layout = QVBoxLayout()
+    
+    ui.processedDisplayLabel = QLabel()
+    ui.processedDisplayLabel.setObjectName("processedDisplayLabel")
+    ui.processedDisplayLabel.setText("AI 辨識影像將顯示於此")
+    ui.processedDisplayLabel.setAlignment(Qt.AlignCenter)
+    ui.processedDisplayLabel.setMinimumSize(400, 300)
+    ui.processedDisplayLabel.setStyleSheet("background-color: #1a1a2e; border: 2px solid #16213e; border-radius: 5px;")
+    detection_display_layout.addWidget(ui.processedDisplayLabel, 1)  # 影像佔用更大空間
+
+    # 辨識結果文字
+    ui.detectionResultText = QTextEdit()
+    ui.detectionResultText.setObjectName("detectionResultText")
+    ui.detectionResultText.setReadOnly(True)
+    ui.detectionResultText.setText("辨識結果文字...")
+    ui.detectionResultText.setMaximumHeight(120)
+    ui.detectionResultText.setStyleSheet("background-color: #0f0f23; color: #00ff88; font-family: Consolas, monospace;")
+    detection_display_layout.addWidget(ui.detectionResultText)
+
+    detection_display_group.setLayout(detection_display_layout)
+    left_layout.addWidget(detection_display_group)
+    
+    # =======================================
+    # 右側：控制面板 (佔 30-40%，可捲動)
+    # =======================================
+    right_panel = QWidget()
+    right_layout = QVBoxLayout(right_panel)
+    right_layout.setContentsMargins(5, 5, 5, 5)
+    
+    # 使用 QScrollArea 讓控制面板可捲動
+    scroll_area = QScrollArea()
+    scroll_area.setWidgetResizable(True)
+    scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    scroll_area.setStyleSheet("QScrollArea { border: none; }")
+    
+    # 控制面板容器
+    control_container = QWidget()
+    control_layout = QVBoxLayout(control_container)
+    control_layout.setSpacing(10)
+
+    # === AI 檢測參數控制區 ===
+    ai_param_group = QGroupBox("AI 檢測參數設定")
+    ai_param_layout = QVBoxLayout()
+    
+    # 參數輸入區 - 改為垂直排列以節省寬度
+    conf_layout = QHBoxLayout()
+    conf_layout.addWidget(QLabel("信心指數:"))
+    ui.edtConfThres = QLineEdit(str(ai_conf_thres))
+    ui.edtConfThres.setMaximumWidth(60)
+    conf_layout.addWidget(ui.edtConfThres)
+    conf_layout.addStretch()
+    ai_param_layout.addLayout(conf_layout)
+    
+    imgsz_layout = QHBoxLayout()
+    imgsz_layout.addWidget(QLabel("影像大小:"))
+    ui.edtImgSize = QLineEdit(str(ai_imgsz))
+    ui.edtImgSize.setMaximumWidth(60)
+    imgsz_layout.addWidget(ui.edtImgSize)
+    imgsz_layout.addStretch()
+    ai_param_layout.addLayout(imgsz_layout)
+    
+    ai_btn_layout = QHBoxLayout()
+    ui.bnUpdateAIParams = QPushButton("更新")
+    ui.bnResetAIParams = QPushButton("重設")
+    ai_btn_layout.addWidget(ui.bnUpdateAIParams)
+    ai_btn_layout.addWidget(ui.bnResetAIParams)
+    ai_param_layout.addLayout(ai_btn_layout)
+    
+    ui.lblCurrentParams = QLabel(i18n.tr_fmt("信心: {conf}, 大小: {size}", conf=ai_conf_thres, size=ai_imgsz))
+    ui.lblCurrentParams.setStyleSheet("color: blue; font-size: 10px;")
+    ai_param_layout.addWidget(ui.lblCurrentParams)
+    
+    ai_param_group.setLayout(ai_param_layout)
+    control_layout.addWidget(ai_param_group)
+
+    # === 邊界線過濾設定區塊 ===
+    boundary_group = QGroupBox("邊界線過濾設定")
+    boundary_layout = QVBoxLayout()
+    
+    # 啟用/停用邊界線過濾
+    ui.chkBoundaryFilterEnabled = QCheckBox("啟用邊界線過濾")
+    ui.chkBoundaryFilterEnabled.setChecked(True)
+    ui.chkBoundaryFilterEnabled.setStyleSheet("font-weight: bold;")
+    boundary_layout.addWidget(ui.chkBoundaryFilterEnabled)
+    
+    # 上邊界線設定
+    top_line_layout = QHBoxLayout()
+    top_line_layout.addWidget(QLabel("上線:"))
+    ui.sliderTopLine = QSlider(Qt.Horizontal)
+    ui.sliderTopLine.setMinimum(0)
+    ui.sliderTopLine.setMaximum(100)
+    ui.sliderTopLine.setValue(25)
+    top_line_layout.addWidget(ui.sliderTopLine)
+    ui.edtTopLinePercent = QLineEdit("25")
+    ui.edtTopLinePercent.setMaximumWidth(40)
+    top_line_layout.addWidget(ui.edtTopLinePercent)
+    top_line_layout.addWidget(QLabel("%"))
+    ui.lblTopLineColor = QLabel("■")
+    ui.lblTopLineColor.setStyleSheet("color: yellow; font-weight: bold;")
+    top_line_layout.addWidget(ui.lblTopLineColor)
+    boundary_layout.addLayout(top_line_layout)
+    
+    # 下邊界線設定
+    bottom_line_layout = QHBoxLayout()
+    bottom_line_layout.addWidget(QLabel("下線:"))
+    ui.sliderBottomLine = QSlider(Qt.Horizontal)
+    ui.sliderBottomLine.setMinimum(0)
+    ui.sliderBottomLine.setMaximum(100)
+    ui.sliderBottomLine.setValue(75)
+    bottom_line_layout.addWidget(ui.sliderBottomLine)
+    ui.edtBottomLinePercent = QLineEdit("75")
+    ui.edtBottomLinePercent.setMaximumWidth(40)
+    bottom_line_layout.addWidget(ui.edtBottomLinePercent)
+    bottom_line_layout.addWidget(QLabel("%"))
+    ui.lblBottomLineColor = QLabel("■")
+    ui.lblBottomLineColor.setStyleSheet("color: cyan; font-weight: bold;")
+    bottom_line_layout.addWidget(ui.lblBottomLineColor)
+    boundary_layout.addLayout(bottom_line_layout)
+    
+    # 按鈕區域
+    boundary_btn_layout = QHBoxLayout()
+    ui.bnApplyBoundaryLines = QPushButton("套用")
+    ui.bnResetBoundaryLines = QPushButton("重設")
+    boundary_btn_layout.addWidget(ui.bnApplyBoundaryLines)
+    boundary_btn_layout.addWidget(ui.bnResetBoundaryLines)
+    boundary_layout.addLayout(boundary_btn_layout)
+    
+    # 目前邊界線狀態
+    ui.lblBoundaryStatus = QLabel("上線 25%, 下線 75%")
+    ui.lblBoundaryStatus.setStyleSheet("color: blue; font-size: 10px;")
+    boundary_layout.addWidget(ui.lblBoundaryStatus)
+    
+    boundary_group.setLayout(boundary_layout)
+    control_layout.addWidget(boundary_group)
+
+    # === TCP 伺服器控制區 ===
+    tcp_control_group = QGroupBox("TCP 伺服器控制")
+    tcp_control_layout = QVBoxLayout()
+    
+    host_layout = QHBoxLayout()
+    host_layout.addWidget(QLabel("主機:"))
+    ui.edtTcpHost = QLineEdit("192.168.1.3")
+    host_layout.addWidget(ui.edtTcpHost)
+    tcp_control_layout.addLayout(host_layout)
+    
+    port_layout = QHBoxLayout()
+    port_layout.addWidget(QLabel("埠號:"))
+    ui.edtTcpPort = QLineEdit("8888")
+    port_layout.addWidget(ui.edtTcpPort)
+    tcp_control_layout.addLayout(port_layout)
+    
+    tcp_btn_layout = QHBoxLayout()
+    ui.bnStartTCP = QPushButton("啟動")
+    ui.bnStopTCP = QPushButton("停止")
+    ui.bnStopTCP.setEnabled(False)
+    tcp_btn_layout.addWidget(ui.bnStartTCP)
+    tcp_btn_layout.addWidget(ui.bnStopTCP)
+    tcp_control_layout.addLayout(tcp_btn_layout)
+    
+    ui.lblTcpStatus = QLabel("TCP: 未連接")
+    ui.lblTcpStatus.setStyleSheet("color: red; font-weight: bold; font-size: 11px;")
+    tcp_control_layout.addWidget(ui.lblTcpStatus)
+    
+    tcp_control_group.setLayout(tcp_control_layout)
+    control_layout.addWidget(tcp_control_group)
+    
+    # === 共享記憶體控制區塊 (簡化版) ===
+    shared_mem_group = QGroupBox("共享記憶體")
+    shared_mem_layout = QVBoxLayout()
+    
+    # 連接設定
+    host_conn_layout = QHBoxLayout()
+    host_conn_layout.addWidget(QLabel("IP:"))
+    ui.edtSharedMemHost = QLineEdit("127.0.0.1")
+    host_conn_layout.addWidget(ui.edtSharedMemHost)
+    shared_mem_layout.addLayout(host_conn_layout)
+    
+    port_conn_layout = QHBoxLayout()
+    port_conn_layout.addWidget(QLabel("埠號:"))
+    ui.edtSharedMemPort = QLineEdit("9999")
+    port_conn_layout.addWidget(ui.edtSharedMemPort)
+    shared_mem_layout.addLayout(port_conn_layout)
+    
+    # 控制按鈕
+    shared_btn_layout = QHBoxLayout()
+    ui.bnStartSharedMem = QPushButton("啟動")
+    ui.bnStopSharedMem = QPushButton("停止")
+    ui.bnStopSharedMem.setEnabled(False)
+    shared_btn_layout.addWidget(ui.bnStartSharedMem)
+    shared_btn_layout.addWidget(ui.bnStopSharedMem)
+    shared_mem_layout.addLayout(shared_btn_layout)
+    
+    ui.bnManualShare = QPushButton("手動分享")
+    ui.bnManualShare.setEnabled(False)
+    shared_mem_layout.addWidget(ui.bnManualShare)
+    
+    # 自動分享選項
+    ui.chkAutoShare = QCheckBox("自動分享")
+    ui.chkAutoShare.setChecked(False)
+    ui.chkAutoShare.setEnabled(False)
+    shared_mem_layout.addWidget(ui.chkAutoShare)
+    
+    # 狀態顯示
+    ui.lblSharedMemStatus = QLabel("未啟動")
+    ui.lblSharedMemStatus.setStyleSheet("color: red; font-size: 10px;")
+    shared_mem_layout.addWidget(ui.lblSharedMemStatus)
+    
+    shared_mem_group.setLayout(shared_mem_layout)
+    control_layout.addWidget(shared_mem_group)
+    
+    # === 圖片儲存設定區塊 ===
+    image_save_group = QGroupBox("圖片儲存設定")
+    image_save_layout = QVBoxLayout()
+    
+    # 啟用開關
+    ui.chkImageSaveEnabled = QCheckBox("啟用圖片儲存")
+    ui.chkImageSaveEnabled.setChecked(False)
+    image_save_layout.addWidget(ui.chkImageSaveEnabled)
+    
+    # 選擇路徑按鈕
+    ui.bnSelectSavePath = QPushButton("選擇路徑")
+    image_save_layout.addWidget(ui.bnSelectSavePath)
+    
+    # 路徑顯示標籤
+    ui.lblSavePath = QLabel("未設定路徑")
+    ui.lblSavePath.setStyleSheet("color: gray; font-size: 9px; word-wrap: break-word;")
+    ui.lblSavePath.setWordWrap(True)
+    image_save_layout.addWidget(ui.lblSavePath)
+    
+    # 狀態標籤
+    ui.lblImageSaveStatus = QLabel("儲存: 停用")
+    ui.lblImageSaveStatus.setStyleSheet("color: red; font-weight: bold; font-size: 10px;")
+    image_save_layout.addWidget(ui.lblImageSaveStatus)
+    
+    image_save_group.setLayout(image_save_layout)
+    control_layout.addWidget(image_save_group)
+    
+    # 加入彈性空間
+    control_layout.addStretch()
+    
+    # 設定 scroll area
+    scroll_area.setWidget(control_container)
+    right_layout.addWidget(scroll_area)
+    
+    # =======================================
+    # 使用 QSplitter 分割左右面板
+    # =======================================
+    splitter = QSplitter(Qt.Horizontal)
+    splitter.addWidget(left_panel)
+    splitter.addWidget(right_panel)
+    splitter.setSizes([700, 300])  # 預設比例 70:30
+    splitter.setCollapsible(0, False)  # 左側不可收合
+    splitter.setCollapsible(1, False)  # 右側不可收合
+    
+    main_tcp_layout.addWidget(splitter)
+
+    tabs.addTab(tcp_widget, "TCP 控制與辨識結果")
+    mainWindow.setCentralWidget(tabs)
+
+    # --- 語言切換 / language switching ---
+    # register_tree() must run here: after every widget exists, and before any
+    # translation is applied. It snapshots the Chinese original of each label
+    # so switching back and forth always translates from the source string
+    # rather than from whatever is currently on screen.
+    i18n.register_tree(mainWindow)
+
+    for label, code in i18n.LANGUAGES:
+        ui.ComboLanguage.addItem(label, code)
+
+    def change_language(index):
+        i18n.set_language(ui.ComboLanguage.itemData(index), mainWindow, tabs)
+        # These labels are rewritten at runtime, so the registry snapshot does
+        # not own their current text. Rebuild them from the widgets that hold
+        # the actual values.
+        update_ai_param_display()
+        try:
+            ui.lblBoundaryStatus.setText(i18n.tr_fmt(
+                "目前邊界線: 上線 {top}%, 下線 {bottom}%",
+                top=ui.edtTopLinePercent.text(),
+                bottom=ui.edtBottomLinePercent.text()))
+        except (AttributeError, RuntimeError):
+            pass
+
+    saved = i18n.load_saved()
+    ui.ComboLanguage.setCurrentIndex(
+        next((i for i, (_, code) in enumerate(i18n.LANGUAGES) if code == saved), 0))
+    if saved != "zh_TW":
+        i18n.set_language(saved, mainWindow, tabs)
+    ui.ComboLanguage.currentIndexChanged.connect(change_language)
+
+    # --- 連接按鈕事件 ---
+    ui.bnEnum.clicked.connect(enum_devices)
+    ui.bnOpen.clicked.connect(open_device)
+    ui.bnClose.clicked.connect(close_device)
+    ui.bnStart.clicked.connect(start_grabbing)
+    ui.bnStop.clicked.connect(stop_grabbing)
+    ui.bnSoftwareTrigger.clicked.connect(trigger_once)
+    ui.radioTriggerMode.clicked.connect(set_software_trigger_mode)
+    ui.radioContinueMode.clicked.connect(set_continue_mode)
+    ui.bnGetParam.clicked.connect(get_param)
+    ui.bnSetParam.clicked.connect(set_param)
+    ui.bnSaveImage.clicked.connect(save_bmp)
+    ui.bnLoadModel.clicked.connect(load_ai_model)
+    ui.bnStartTCP.clicked.connect(start_tcp_server_func)
+    ui.bnStopTCP.clicked.connect(stop_tcp_server_func)
+    
+    # === 新增 AI 參數控制按鈕事件 ===
+    ui.bnUpdateAIParams.clicked.connect(update_ai_parameters)
+    ui.bnResetAIParams.clicked.connect(reset_ai_parameters)
+
+    # === 新增 邊界線設定事件處理函數 ===
+    def update_top_line_from_slider():
+        """滑桿更新時同步更新文字框"""
+        value = ui.sliderTopLine.value()
+        ui.edtTopLinePercent.setText(str(value))
+    
+    def update_bottom_line_from_slider():
+        """滑桿更新時同步更新文字框"""
+        value = ui.sliderBottomLine.value()
+        ui.edtBottomLinePercent.setText(str(value))
+    
+    def update_top_line_from_text():
+        """文字框更新時同步更新滑桿"""
+        try:
+            value = int(ui.edtTopLinePercent.text())
+            value = max(0, min(100, value))
+            ui.sliderTopLine.setValue(value)
+        except ValueError:
+            pass
+    
+    def update_bottom_line_from_text():
+        """文字框更新時同步更新滑桿"""
+        try:
+            value = int(ui.edtBottomLinePercent.text())
+            value = max(0, min(100, value))
+            ui.sliderBottomLine.setValue(value)
+        except ValueError:
+            pass
+    
+    def apply_boundary_lines():
+        """套用邊界線設定"""
+        try:
+            top_percent = int(ui.edtTopLinePercent.text())
+            bottom_percent = int(ui.edtBottomLinePercent.text())
+            
+            # 驗證範圍
+            if not (0 <= top_percent <= 100) or not (0 <= bottom_percent <= 100):
+                QMessageBox.warning(mainWindow, "參數錯誤", "邊界線位置必須介於 0 到 100 之間！")
+                return
+            
+            # 驗證上線必須在下線之上
+            if top_percent >= bottom_percent:
+                QMessageBox.warning(mainWindow, "參數錯誤", "上邊界線位置必須小於下邊界線位置！")
+                return
+            
+            # 設定邊界線位置 (轉換為 0.0 ~ 1.0 的比例)
+            set_boundary_line_positions(top_percent / 100.0, bottom_percent / 100.0)
+            
+            # 更新狀態顯示
+            ui.lblBoundaryStatus.setText(i18n.tr_fmt("目前邊界線: 上線 {top}%, 下線 {bottom}%", top=top_percent, bottom=bottom_percent))
+            
+            QMessageBox.information(mainWindow, "邊界線設定", 
+                f"邊界線已更新：\n上邊界線: {top_percent}%\n下邊界線: {bottom_percent}%")
+            
+        except ValueError:
+            QMessageBox.warning(mainWindow, "參數錯誤", "請輸入有效的數值！")
+    
+    def reset_boundary_lines():
+        """重設邊界線為預設值"""
+        ui.sliderTopLine.setValue(25)
+        ui.sliderBottomLine.setValue(75)
+        ui.edtTopLinePercent.setText("25")
+        ui.edtBottomLinePercent.setText("75")
+        set_boundary_line_positions(0.25, 0.75)
+        ui.lblBoundaryStatus.setText(i18n.tr_fmt("目前邊界線: 上線 {top}%, 下線 {bottom}%", top=25, bottom=75))
+        QMessageBox.information(mainWindow, "邊界線設定", "邊界線已重設為預設值：\n上邊界線: 25%\n下邊界線: 75%")
+    
+    def toggle_boundary_filter():
+        """切換邊界線過濾功能"""
+        enabled = ui.chkBoundaryFilterEnabled.isChecked()
+        set_boundary_filter_enabled(enabled)
+        
+        # 更新 UI 狀態
+        ui.sliderTopLine.setEnabled(enabled)
+        ui.sliderBottomLine.setEnabled(enabled)
+        ui.edtTopLinePercent.setEnabled(enabled)
+        ui.edtBottomLinePercent.setEnabled(enabled)
+        ui.bnApplyBoundaryLines.setEnabled(enabled)
+        ui.bnResetBoundaryLines.setEnabled(enabled)
+        
+        if enabled:
+            QMessageBox.information(mainWindow, "邊界線過濾", 
+                "✅ 已啟用邊界線過濾\n\n只有觸碰到邊界線的辨識結果才會傳送給 TCP/IP")
+        else:
+            QMessageBox.information(mainWindow, "邊界線過濾", 
+                "⏸ 已停用邊界線過濾\n\n所有辨識結果都會傳送給 TCP/IP")
+    
+    # 連接邊界線設定事件
+    ui.sliderTopLine.valueChanged.connect(update_top_line_from_slider)
+    ui.sliderBottomLine.valueChanged.connect(update_bottom_line_from_slider)
+    ui.edtTopLinePercent.editingFinished.connect(update_top_line_from_text)
+    ui.edtBottomLinePercent.editingFinished.connect(update_bottom_line_from_text)
+    ui.bnApplyBoundaryLines.clicked.connect(apply_boundary_lines)
+    ui.bnResetBoundaryLines.clicked.connect(reset_boundary_lines)
+    ui.chkBoundaryFilterEnabled.stateChanged.connect(toggle_boundary_filter)
+
+    # --- 新增: 連接訊號與槽 ---
+    signals.original_image_ready.connect(update_original_display)
+    signals.processed_image_ready.connect(update_processed_display)
+    signals.detection_results_ready.connect(update_detection_text)
+
+    # === 連接共享記憶體相關信號 ===
+    ui.bnStartSharedMem.clicked.connect(start_shared_memory)
+    ui.bnStopSharedMem.clicked.connect(stop_shared_memory)
+    ui.bnManualShare.clicked.connect(manual_share_current_frame)
+    ui.chkAutoShare.stateChanged.connect(toggle_auto_share)
+    
+    # === 連接圖片儲存相關按鈕事件 ===
+    ui.bnSelectSavePath.clicked.connect(select_save_path)
+    ui.chkImageSaveEnabled.stateChanged.connect(toggle_image_save)
+    shared_mem_timer = QTimer()
+    shared_mem_timer.timeout.connect(update_shared_memory_ui)
+    shared_mem_timer.start(1000)  # 每秒更新一次
+
+    # --- 顯示與清理 ---
+    mainWindow.show()
+    # 設置AI參數函數參考
+    set_ai_parameters_func(get_ai_parameters)
+    
+    # === 自動初始化函數 ===
+    def auto_initialize():
+        """
+        自動初始化流程：
+        1. 自動枚舉設備
+        2. 自動打開設備（選擇第一個）
+        3. 自動設置觸發模式
+        4. 自動開始採集
+        """
+        global deviceList, nSelCamIndex, obj_cam_operation, isOpen, isGrabbing
+        
+        print("=" * 50)
+        print("正在執行自動初始化...")
+        print("=" * 50)
+        
+        # 步驟 1: 自動枚舉設備
+        print("[步驟 1/4] 正在搜尋設備...")
+        deviceList = MV_CC_DEVICE_INFO_LIST()
+        ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, deviceList)
+        
+        if ret != 0:
+            print(f"[錯誤] 設備枚舉失敗! 錯誤碼: {ToHexStr(ret)}")
+            QMessageBox.warning(mainWindow, "自動初始化失敗", 
+                f"設備枚舉失敗!\n錯誤碼: {ToHexStr(ret)}", QMessageBox.Ok)
+            return False
+        
+        if deviceList.nDeviceNum == 0:
+            print("[錯誤] 未找到任何設備!")
+            QMessageBox.warning(mainWindow, "自動初始化失敗", 
+                "未找到任何相機設備!\n請確認相機已正確連接。", QMessageBox.Ok)
+            return False
+        
+        print(f"[成功] 找到 {deviceList.nDeviceNum} 個設備")
+        
+        # 更新設備列表 UI
+        devList = []
+        for i in range(0, deviceList.nDeviceNum):
+            mvcc_dev_info = cast(deviceList.pDeviceInfo[i], POINTER(MV_CC_DEVICE_INFO)).contents
+            if mvcc_dev_info.nTLayerType == MV_GIGE_DEVICE:
+                chUserDefinedName = ""
+                for per in mvcc_dev_info.SpecialInfo.stGigEInfo.chUserDefinedName:
+                    if 0 == per:
+                        break
+                    chUserDefinedName += chr(per)
+                chModelName = ""
+                for per in mvcc_dev_info.SpecialInfo.stGigEInfo.chModelName:
+                    if 0 == per:
+                        break
+                    chModelName += chr(per)
+                nip1 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0xff000000) >> 24)
+                nip2 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x00ff0000) >> 16)
+                nip3 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x0000ff00) >> 8)
+                nip4 = (mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x000000ff)
+                devList.append(
+                    f"[{i}]GigE: {chUserDefinedName} {chModelName}({nip1}.{nip2}.{nip3}.{nip4})")
+            elif mvcc_dev_info.nTLayerType == MV_USB_DEVICE:
+                chUserDefinedName = ""
+                for per in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chUserDefinedName:
+                    if per == 0:
+                        break
+                    chUserDefinedName += chr(per)
+                chModelName = ""
+                for per in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chModelName:
+                    if 0 == per:
+                        break
+                    chModelName += chr(per)
+                strSerialNumber = ""
+                for per in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chSerialNumber:
+                    if per == 0:
+                        break
+                    strSerialNumber += chr(per)
+                devList.append(f"[{i}]USB: {chUserDefinedName} {chModelName}({strSerialNumber})")
+        
+        ui.ComboDevices.clear()
+        ui.ComboDevices.addItems(devList)
+        ui.ComboDevices.setCurrentIndex(0)
+        
+        # 步驟 2: 自動打開設備（選擇第一個設備）
+        print("[步驟 2/4] 正在打開設備...")
+        nSelCamIndex = 0  # 選擇第一個設備
+        obj_cam_operation = CameraOperation(cam, deviceList, nSelCamIndex)
+        ret = obj_cam_operation.Open_device()
+        
+        if ret != 0:
+            print(f"[錯誤] 設備打開失敗! 錯誤碼: {ToHexStr(ret)}")
+            QMessageBox.warning(mainWindow, "自動初始化失敗", 
+                f"設備打開失敗!\n錯誤碼: {ToHexStr(ret)}", QMessageBox.Ok)
+            isOpen = False
+            return False
+        
+        isOpen = True
+        print(f"[成功] 設備已打開: {devList[0]}")
+        
+        # 步驟 3: 設置觸發模式（軟體觸發模式）
+        print("[步驟 3/4] 正在設置觸發模式...")
+        ret = obj_cam_operation.Set_trigger_mode(True)  # True = 觸發模式, False = 連續模式
+        if ret == 0:
+            ui.radioContinueMode.setChecked(False)
+            ui.radioTriggerMode.setChecked(True)
+            print("[成功] 已設置為軟體觸發模式")
+        else:
+            print(f"[警告] 設置觸發模式失敗，保持預設模式")
+        
+        # 獲取並設置相機參數
+        get_param()
+        
+        # 步驟 4: 自動開始採集
+        print("[步驟 4/4] 正在開始採集...")
+        ret = obj_cam_operation.Start_grabbing(signals)
+        
+        if ret != 0:
+            print(f"[錯誤] 開始採集失敗! 錯誤碼: {ToHexStr(ret)}")
+            QMessageBox.warning(mainWindow, "自動初始化失敗", 
+                f"開始採集失敗!\n錯誤碼: {ToHexStr(ret)}", QMessageBox.Ok)
+            return False
+        
+        isGrabbing = True
+        print("[成功] 採集已開始")
+        
+        # 更新 UI 控制狀態
+        enable_controls()
+        ui.bnSoftwareTrigger.setEnabled(True)  # 觸發模式下允許軟體觸發
+        
+        print("=" * 50)
+        print("自動初始化完成！")
+        print("  - 設備: " + devList[0])
+        print("  - 模式: 軟體觸發模式")
+        print("  - 狀態: 正在採集，等待觸發信號")
+        print("=" * 50)
+        
+        return True
+    
+    # 使用 QTimer 延遲執行自動初始化，確保 UI 完全載入
+    auto_init_timer = QTimer()
+    auto_init_timer.setSingleShot(True)
+    auto_init_timer.timeout.connect(auto_initialize)
+    auto_init_timer.start(500)  # 500ms 後執行自動初始化
+    
+    def cleanup():
+        print("Cleaning up resources...")
+        # 停止 TCP 服務器
+        try:
+            stop_tcp_server()
+        except:
+            pass
+        
+        # 停止共享記憶體
+        try:
+            stop_shared_memory()
+        except:
+            pass
+        
+        # 關閉相機
+        try:
+            close_device()
+        except:
+            pass
+        print("Cleanup finished.")
+    
+    app.aboutToQuit.connect(cleanup)
+    
+    sys.exit(app.exec_())

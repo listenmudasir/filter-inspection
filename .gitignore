@@ -1,0 +1,10 @@
+# Weights are copied to each machine, never committed (262 MiB > GitHub's
+# 100 MB per-file limit). See weights/README.md.
+weights/*.pt
+weights/*.ckpt
+
+__pycache__/
+*.pyc
+.gui_language
+*.log
+runs/
