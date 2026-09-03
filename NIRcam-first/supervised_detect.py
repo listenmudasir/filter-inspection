@@ -112,7 +112,20 @@ _CLASS_ID = {n: i for i, n in enumerate(CLASS_NAMES)}
 
 
 class _Tensorish:
-    """numpy array wearing the .cpu().numpy() interface torch tensors have."""
+    """numpy array wearing the torch-tensor interface ultralytics exposes.
+
+    Must support the FULL access pattern CamOperation_class uses, not just the
+    parts we happened to exercise offline:
+
+        box.xyxy[0].cpu().numpy()      -> indexing must stay wrapped
+        int(box.cls.item())            -> .item() for scalars
+        len(results[0].boxes)
+
+    The first version only had cpu()/numpy()/len/getitem. That was enough for
+    draw_custom_boxes -- which reads .xyxy.cpu().numpy() in bulk -- so it
+    passed every offline test, and then failed on live frames with
+    "'_Boxes' object is not iterable" the moment the boundary-filter path ran.
+    """
 
     def __init__(self, array):
         self._array = array
@@ -123,11 +136,25 @@ class _Tensorish:
     def numpy(self):
         return self._array
 
+    def item(self):
+        return self._array.item()
+
+    def tolist(self):
+        return self._array.tolist()
+
     def __len__(self):
         return len(self._array)
 
+    def __iter__(self):
+        return iter(self._array)
+
     def __getitem__(self, item):
-        return self._array[item]
+        # Stay wrapped so chains like .xyxy[0].cpu().numpy() work.
+        value = self._array[item]
+        return _Tensorish(value) if isinstance(value, np.ndarray) else value
+
+    def __float__(self):
+        return float(self._array)
 
 
 class _Boxes:
@@ -138,6 +165,27 @@ class _Boxes:
 
     def __len__(self):
         return len(self.xyxy)
+
+    def __iter__(self):
+        """Yield one single-row _Boxes per detection, as ultralytics does.
+
+        CamOperation_class:806 relies on this:
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                cls = int(box.cls.item())
+        """
+        arr_xyxy = self.xyxy.numpy()
+        arr_conf = self.conf.numpy()
+        arr_cls = self.cls.numpy()
+        for i in range(len(arr_xyxy)):
+            yield _Boxes(arr_xyxy[i:i + 1], arr_conf[i:i + 1], arr_cls[i:i + 1])
+
+    def __getitem__(self, index):
+        arr_xyxy = self.xyxy.numpy()
+        arr_conf = self.conf.numpy()
+        arr_cls = self.cls.numpy()
+        return _Boxes(arr_xyxy[index:index + 1], arr_conf[index:index + 1],
+                      arr_cls[index:index + 1])
 
 
 class _Result:
