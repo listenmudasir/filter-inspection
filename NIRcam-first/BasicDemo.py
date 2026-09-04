@@ -3,7 +3,7 @@
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import QTimer, QObject, pyqtSignal, Qt
 from PyQt5.QtGui import QImage, QPixmap
-from CamOperation_class import CameraOperation
+from CamOperation_class import CameraOperation, describe_open_error
 from MvImport.MvCameraControl_class import *
 from MvImport.MvErrorDefine_const import *
 from MvImport.CameraParams_header import *
@@ -39,6 +39,15 @@ ai_model = load_model(_os.path.abspath(_DEPLOY))  # hybrid EfficientAD deploymen
 print("-----------------------------------Entry Yolo-Model-----7 class , material -------------------------")
 from CamOperation_class import set_ai_model
 set_ai_model(ai_model)
+
+# 觸發來源。CameraOperation.Set_trigger_mode 的預設值是 "Line0"（硬體觸發），
+# 而呼叫端都沒有傳這個參數，於是相機被設成等待 Line0 的硬體脈衝，畫面卻顯示
+# 「軟體觸發模式」並開放軟體觸發按鈕 —— 按下去相機不理會，取流只會一直回
+# 80000007 (MV_E_NODATA)、完全沒有畫面。這裡把來源講明白。
+#
+# 產線若是由外部訊號驅動，改用 Line0：
+#     set NIRCAM_TRIGGER_SOURCE=Line0
+TRIGGER_SOURCE = _os.environ.get("NIRCAM_TRIGGER_SOURCE", "Software")
 
 # 新增全域變數用於控制 AI 檢測參數
 ai_conf_thres = 0.4  # 默認信心指數閾值
@@ -506,7 +515,7 @@ if __name__ == "__main__":
         obj_cam_operation = CameraOperation(cam, deviceList, nSelCamIndex)
         ret = obj_cam_operation.Open_device()
         if 0 != ret:
-            strError = "Open device failed ret:" + ToHexStr(ret)
+            strError = "開啟設備失敗\n" + describe_open_error(ret)
             QMessageBox.warning(mainWindow, "Error", strError, QMessageBox.Ok)
             isOpen = False
         else:
@@ -559,7 +568,9 @@ if __name__ == "__main__":
             ui.bnSoftwareTrigger.setEnabled(False)
 
     def set_software_trigger_mode():
-        ret = obj_cam_operation.Set_trigger_mode(True)
+        # 一定要指定來源，否則會落到 Set_trigger_mode 的預設 "Line0"，
+        # 相機等硬體脈衝而軟體觸發按鈕完全無效。
+        ret = obj_cam_operation.Set_trigger_mode(True, source=TRIGGER_SOURCE)
         if ret == 0:
             ui.radioContinueMode.setChecked(False)
             ui.radioTriggerMode.setChecked(True)
@@ -808,9 +819,9 @@ if __name__ == "__main__":
     ui.sliderTopLine = QSlider(Qt.Horizontal)
     ui.sliderTopLine.setMinimum(0)
     ui.sliderTopLine.setMaximum(100)
-    ui.sliderTopLine.setValue(25)
+    ui.sliderTopLine.setValue(0)
     top_line_layout.addWidget(ui.sliderTopLine)
-    ui.edtTopLinePercent = QLineEdit("25")
+    ui.edtTopLinePercent = QLineEdit("0")
     ui.edtTopLinePercent.setMaximumWidth(40)
     top_line_layout.addWidget(ui.edtTopLinePercent)
     top_line_layout.addWidget(QLabel("%"))
@@ -825,9 +836,9 @@ if __name__ == "__main__":
     ui.sliderBottomLine = QSlider(Qt.Horizontal)
     ui.sliderBottomLine.setMinimum(0)
     ui.sliderBottomLine.setMaximum(100)
-    ui.sliderBottomLine.setValue(75)
+    ui.sliderBottomLine.setValue(100)
     bottom_line_layout.addWidget(ui.sliderBottomLine)
-    ui.edtBottomLinePercent = QLineEdit("75")
+    ui.edtBottomLinePercent = QLineEdit("100")
     ui.edtBottomLinePercent.setMaximumWidth(40)
     bottom_line_layout.addWidget(ui.edtBottomLinePercent)
     bottom_line_layout.addWidget(QLabel("%"))
@@ -845,7 +856,7 @@ if __name__ == "__main__":
     boundary_layout.addLayout(boundary_btn_layout)
     
     # 目前邊界線狀態
-    ui.lblBoundaryStatus = QLabel("上線 25%, 下線 75%")
+    ui.lblBoundaryStatus = QLabel("上線 0%, 下線 100%")
     ui.lblBoundaryStatus.setStyleSheet("color: blue; font-size: 10px;")
     boundary_layout.addWidget(ui.lblBoundaryStatus)
     
@@ -1086,13 +1097,13 @@ if __name__ == "__main__":
     
     def reset_boundary_lines():
         """重設邊界線為預設值"""
-        ui.sliderTopLine.setValue(25)
-        ui.sliderBottomLine.setValue(75)
-        ui.edtTopLinePercent.setText("25")
-        ui.edtBottomLinePercent.setText("75")
-        set_boundary_line_positions(0.25, 0.75)
-        ui.lblBoundaryStatus.setText(i18n.tr_fmt("目前邊界線: 上線 {top}%, 下線 {bottom}%", top=25, bottom=75))
-        QMessageBox.information(mainWindow, "邊界線設定", "邊界線已重設為預設值：\n上邊界線: 25%\n下邊界線: 75%")
+        ui.sliderTopLine.setValue(0)
+        ui.sliderBottomLine.setValue(100)
+        ui.edtTopLinePercent.setText("0")
+        ui.edtBottomLinePercent.setText("100")
+        set_boundary_line_positions(0.0, 1.0)
+        ui.lblBoundaryStatus.setText(i18n.tr_fmt("目前邊界線: 上線 {top}%, 下線 {bottom}%", top=0, bottom=100))
+        QMessageBox.information(mainWindow, "邊界線設定", "邊界線已重設為預設值：\n上邊界線: 0%\n下邊界線: 100%")
     
     def toggle_boundary_filter():
         """切換邊界線過濾功能"""
@@ -1230,9 +1241,10 @@ if __name__ == "__main__":
         ret = obj_cam_operation.Open_device()
         
         if ret != 0:
-            print(f"[錯誤] 設備打開失敗! 錯誤碼: {ToHexStr(ret)}")
-            QMessageBox.warning(mainWindow, "自動初始化失敗", 
-                f"設備打開失敗!\n錯誤碼: {ToHexStr(ret)}", QMessageBox.Ok)
+            detail = describe_open_error(ret)
+            print(f"[錯誤] 設備打開失敗! {detail}")
+            QMessageBox.warning(mainWindow, "自動初始化失敗",
+                f"設備打開失敗!\n{detail}", QMessageBox.Ok)
             isOpen = False
             return False
         
@@ -1241,13 +1253,16 @@ if __name__ == "__main__":
         
         # 步驟 3: 設置觸發模式（軟體觸發模式）
         print("[步驟 3/4] 正在設置觸發模式...")
-        ret = obj_cam_operation.Set_trigger_mode(True)  # True = 觸發模式, False = 連續模式
+        # True = 觸發模式, False = 連續模式。來源必須明講，見 TRIGGER_SOURCE。
+        ret = obj_cam_operation.Set_trigger_mode(True, source=TRIGGER_SOURCE)
         if ret == 0:
             ui.radioContinueMode.setChecked(False)
             ui.radioTriggerMode.setChecked(True)
-            print("[成功] 已設置為軟體觸發模式")
+            print(f"[成功] 已設置為觸發模式，觸發來源: {TRIGGER_SOURCE}")
+            if TRIGGER_SOURCE != "Software":
+                print(f"       等待 {TRIGGER_SOURCE} 硬體脈衝；沒有訊號就不會有畫面。")
         else:
-            print(f"[警告] 設置觸發模式失敗，保持預設模式")
+            print(f"[警告] 設置觸發模式失敗 ({ToHexStr(ret)})，保持預設模式")
         
         # 獲取並設置相機參數
         get_param()

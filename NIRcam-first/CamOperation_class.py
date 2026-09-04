@@ -62,8 +62,8 @@ auto_share_enabled = False
 get_ai_parameters_func = None
 
 # 新增：邊界線過濾參數 (比例，0.0 ~ 1.0)
-boundary_line_top = 0.25      # 上邊界線位置 (從上往下的比例，預設在上緣 1/4 處)
-boundary_line_bottom = 0.75   # 下邊界線位置 (從上往下的比例，預設在下緣 1/4 處)
+boundary_line_top = 0.0       # 上邊界線位置 (從上往下的比例，預設在影像最上緣)
+boundary_line_bottom = 1.0    # 下邊界線位置 (從上往下的比例，預設在影像最下緣)
 boundary_filter_enabled = True  # 是否啟用邊界線過濾
 
 # 新增：圖片儲存控制參數
@@ -267,6 +267,55 @@ def set_auto_share(enabled):
     global auto_share_enabled
     auto_share_enabled = enabled
 
+
+# 開啟設備時要求的像素格式。相機支援 Mono8/10/12、RGB8_Packed、BGR8_Packed、
+# BayerRG8/10/12、BayerRBGG8。預設 BayerRG8 —— 這是影像轉換程式碼原本唯一有
+# 分支處理的彩色格式，也就是管線驗證時所用的路徑。要改用相機端 debayer：
+#     set NIRCAM_PIXEL_FORMAT=RGB8_Packed
+PIXEL_FORMAT = os.environ.get("NIRCAM_PIXEL_FORMAT", "BayerRG8")
+
+
+# MV_CC_OpenDevice 的錯誤碼原本只以 16 進位顯示，操作員無從判斷該做什麼。
+# 這裡只收錄實際會在產線上出現的開啟失敗原因，並直接給出處理步驟。
+_OPEN_ERROR_HELP = {
+    MV_E_ACCESS_DENIED: (
+        "設備無訪問權限 (MV_E_ACCESS_DENIED)",
+        "相機已被其他程式獨佔。最常見的是 MVS 用戶端 (MVS.exe) 還開著。\n"
+        "請關閉 MVS 用戶端後重試；若仍失敗，確認沒有其他主機正在連線這台相機。",
+    ),
+    MV_E_BUSY: (
+        "設備忙碌或網路中斷 (MV_E_BUSY)",
+        "相機正在被佔用或網線已斷。請檢查網線與供電後重試。",
+    ),
+    MV_E_NETER: (
+        "網路相關錯誤 (MV_E_NETER)",
+        "請確認相機與網卡在同一網段，且防火牆未封鎖 GigE Vision 流量。",
+    ),
+    MV_E_DRIVERATTACH: (
+        "GigE 驅動未綁定 (MV_E_DRIVERATTACH)",
+        "請在 MVS 的網卡設定中將驅動綁定到這張網卡。",
+    ),
+    MV_E_IP_CONFLICT: (
+        "設備 IP 衝突 (MV_E_IP_CONFLICT)",
+        "網段內有相同 IP。請用 MVS 的 IP 設定工具改掉其中一個。",
+    ),
+    MV_E_DEV_DISCONNECT: (
+        "設備已斷開連接 (MV_E_DEV_DISCONNECT)",
+        "請重新插拔網線或重新上電後重試。",
+    ),
+}
+
+
+def describe_open_error(ret):
+    """把開啟設備的錯誤碼翻成一句人看得懂的原因 + 處理方式。"""
+    name, advice = _OPEN_ERROR_HELP.get(
+        ret & 0xFFFFFFFF, (None, None))
+    code = f"0x{ret & 0xFFFFFFFF:08X}"
+    if name is None:
+        return f"錯誤碼 {code}"
+    return f"錯誤碼 {code} - {name}\n\n{advice}"
+
+
 class CameraOperation:
     def __init__(self, obj_cam, st_device_list, n_connect_num=0,
                  b_open_device=False, b_start_grabbing=False,
@@ -318,12 +367,35 @@ class CameraOperation:
     
             ret = self.obj_cam.MV_CC_OpenDevice()
             if ret != 0:
+                # Destroy the handle CreateHandle just allocated. Without this
+                # a failed open leaks it, the device stays half-claimed, and
+                # every retry returns the same error even once the real cause
+                # (usually MVS client software holding the camera) is gone --
+                # so the operator sees a permanent failure instead of a
+                # transient one. The CreateHandle failure path above already
+                # does this; the open path did not.
+                self.obj_cam.MV_CC_DestroyHandle()
+                self.obj_cam = None
+                print(f"open device failed: {describe_open_error(ret)}")
                 return ret
             print("open device successfully!")
             self.b_open_device = True
             self.b_thread_closed = False
     
             # ====== 開啟設備成功後，建議加在這裡 ======
+            # 明確設定像素格式，不要相信相機上一次被誰設成什麼。
+            # 影像轉換的 Bayer 分支帶著刻意的紅藍互換，而 RGB8_Packed 是相機
+            # 端做完 debayer 的結果，兩條路徑的通道順序不保證一致 —— 若有人
+            # 用 MVS 把相機改成 RGB8_Packed，模型看到的顏色就會悄悄改變，
+            # 而且不會有任何錯誤訊息。這裡固定回管線驗證時的格式。
+            ret = self.obj_cam.MV_CC_SetEnumValueByString(
+                "PixelFormat", PIXEL_FORMAT)
+            if ret != 0:
+                print(f"set PixelFormat={PIXEL_FORMAT} failed: "
+                      f"0x{ret & 0xFFFFFFFF:08X} (沿用相機目前的設定)")
+            else:
+                print(f"PixelFormat = {PIXEL_FORMAT}")
+
             # 設置白平衡 (1=自動)
             ret = self.obj_cam.MV_CC_SetEnumValue("BalanceWhiteAuto", 1)
             if ret != 0:
@@ -635,42 +707,61 @@ class CameraOperation:
                     # 第一步：影像格式轉換（從 Bayer/Mono 轉為 RGB）
                     # ========================================
                     try:
-                        raw_image = np.asarray(self.buf_grab_image).reshape(
-                            (self.st_frame_info.nHeight, self.st_frame_info.nWidth)
-                        )
-                        
-                        # 根據像素格式進行轉換
-                        if Is_color_data(self.st_frame_info.enPixelType):
-                            # 彩色圖像 - 從 Bayer 格式直接轉換為 RGB
-                            # 注意：嘗試使用 BG 格式來修正紅藍通道互換問題
-                            if self.st_frame_info.enPixelType == PixelType_Gvsp_BayerRG8:
-                                # RG8 使用 BG2RGB 轉換（紅藍互換）
-                                image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_BG2RGB)
-                            elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerGR8:
-                                # GR8 使用 GB2RGB 轉換（紅藍互換）
-                                image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_GB2RGB)
-                            elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerGB8:
-                                # GB8 使用 GR2RGB 轉換（紅藍互換）
-                                image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_GR2RGB)
-                            elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerBG8:
-                                # BG8 使用 RG2RGB 轉換（紅藍互換）
-                                image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_RG2RGB)
+                        nH = self.st_frame_info.nHeight
+                        nW = self.st_frame_info.nWidth
+                        enPT = self.st_frame_info.enPixelType
+
+                        # RGB8/BGR8 Packed：相機端已經做完 debayer，每像素 3 bytes。
+                        # 這種格式不能走下面的單通道 reshape（會直接丟
+                        # "cannot reshape array of size N into shape (H, W)"），
+                        # 也不能再 demosaic 一次。必須先擋在前面。
+                        if enPT in (PixelType_Gvsp_RGB8_Packed,
+                                    PixelType_Gvsp_BGR8_Packed):
+                            packed = np.frombuffer(
+                                self.buf_grab_image, dtype=np.uint8,
+                                count=nH * nW * 3).reshape(nH, nW, 3)
+                            if enPT == PixelType_Gvsp_BGR8_Packed:
+                                image_rgb = cv2.cvtColor(packed, cv2.COLOR_BGR2RGB)
                             else:
-                                # 默認使用 BG8（而不是 RG8）
-                                image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_BG2RGB)
-                        elif Is_mono_data(self.st_frame_info.enPixelType):
-                            # 單色影像轉換為 3 通道供後續處理
-                            mono_array = Mono_numpy(
-                                self.buf_save_image, 
-                                self.st_frame_info.nWidth, 
-                                self.st_frame_info.nHeight
-                            )
-                            # 單色轉 RGB（三個通道相同）
-                            image_rgb = cv2.cvtColor(mono_array.squeeze(), cv2.COLOR_GRAY2RGB)
+                                image_rgb = packed.copy()
+
                         else:
-                            # 未知格式，跳過此幀
-                            print(f"Unsupported pixel format: {self.st_frame_info.enPixelType}")
-                            continue
+                            raw_image = np.asarray(self.buf_grab_image).reshape(
+                                (nH, nW)
+                            )
+
+                            # 根據像素格式進行轉換
+                            if Is_color_data(self.st_frame_info.enPixelType):
+                                # 彩色圖像 - 從 Bayer 格式直接轉換為 RGB
+                                # 注意：嘗試使用 BG 格式來修正紅藍通道互換問題
+                                if self.st_frame_info.enPixelType == PixelType_Gvsp_BayerRG8:
+                                    # RG8 使用 BG2RGB 轉換（紅藍互換）
+                                    image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_BG2RGB)
+                                elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerGR8:
+                                    # GR8 使用 GB2RGB 轉換（紅藍互換）
+                                    image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_GB2RGB)
+                                elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerGB8:
+                                    # GB8 使用 GR2RGB 轉換（紅藍互換）
+                                    image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_GR2RGB)
+                                elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerBG8:
+                                    # BG8 使用 RG2RGB 轉換（紅藍互換）
+                                    image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_RG2RGB)
+                                else:
+                                    # 默認使用 BG8（而不是 RG8）
+                                    image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_BG2RGB)
+                            elif Is_mono_data(self.st_frame_info.enPixelType):
+                                # 單色影像轉換為 3 通道供後續處理
+                                mono_array = Mono_numpy(
+                                    self.buf_save_image, 
+                                    self.st_frame_info.nWidth, 
+                                    self.st_frame_info.nHeight
+                                )
+                                # 單色轉 RGB（三個通道相同）
+                                image_rgb = cv2.cvtColor(mono_array.squeeze(), cv2.COLOR_GRAY2RGB)
+                            else:
+                                # 未知格式，跳過此幀
+                                print(f"Unsupported pixel format: {self.st_frame_info.enPixelType}")
+                                continue
                         
                     except Exception as e:
                         print(f"Image conversion error: {e}")
@@ -901,6 +992,16 @@ class CameraOperation:
     
                         except Exception as e:
                             print(f"AI Detection error: {e}")
+                            # 影像照樣送出去。原本這裡只送錯誤文字，於是任何一個
+                            # AI 例外都會讓畫面完全空白 —— 相機明明在出圖，操作員
+                            # 卻只看到 "Camera image will appear here"，看起來像
+                            # 相機壞了，實際上壞的是辨識。
+                            if hasattr(signals, 'original_image_ready'):
+                                try:
+                                    signals.original_image_ready.emit(
+                                        cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
+                                except Exception:
+                                    pass
                             if hasattr(signals, 'detection_results_ready'):
                                 error_text = f"Frame: {self.st_frame_info.nFrameNum}\n"
                                 error_text += f"AI 辨識時發生錯誤: {str(e)}\n"
