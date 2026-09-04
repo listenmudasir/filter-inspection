@@ -104,9 +104,12 @@ except ImportError:                     # deployment checkout layout
 # an 80 MB backbone it never calls, and a broken hybrid install would stop the
 # supervised path from loading for no reason.
 #
-# The cost is that these must stay shape-compatible with adapter.py. They are
-# ~20 lines of pure container code that has not changed, and the GUI consumes
-# only .boxes.xyxy / .conf / .cls / .names.
+# The cost is that these must stay shape-compatible with adapter.py, and that
+# cost is real: both copies originally assumed the GUI consumes only
+# .boxes.xyxy / .conf / .cls / .names. It does not -- CamOperation_class also
+# ITERATES .boxes, which raised "'_Boxes' object is not iterable" on every
+# frame and left the display blank while the camera was streaming fine. If you
+# extend these, extend adapter.py identically.
 CLASS_NAMES = ["Bug", "Foreign_Body", "Stain", "Unknown"]
 _CLASS_ID = {n: i for i, n in enumerate(CLASS_NAMES)}
 
@@ -123,11 +126,20 @@ class _Tensorish:
     def numpy(self):
         return self._array
 
+    def item(self):
+        return self._array.item()
+
     def __len__(self):
         return len(self._array)
 
+    def __iter__(self):
+        return iter(self._array)
+
     def __getitem__(self, item):
-        return self._array[item]
+        value = self._array[item]
+        # Keep the torch-tensor illusion one level down, so `xyxy[0].cpu()`
+        # works the way callers written against ultralytics expect.
+        return _Tensorish(value) if isinstance(value, np.ndarray) else value
 
 
 class _Boxes:
@@ -138,6 +150,26 @@ class _Boxes:
 
     def __len__(self):
         return len(self.xyxy)
+
+    # ultralytics' Boxes is iterable, and indexing it yields a Boxes holding
+    # one row -- which is why GUI code written against it does
+    #     for box in results[0].boxes:
+    #         box.xyxy[0].cpu().numpy(); box.cls.item(); box.conf.item()
+    # Without these, that loop raises "'_Boxes' object is not iterable" and
+    # the caller never reaches its own emit/draw calls.
+    def __getitem__(self, index):
+        xyxy, conf, cls = (self.xyxy.numpy(), self.conf.numpy(),
+                           self.cls.numpy())
+        if isinstance(index, slice):
+            return _Boxes(xyxy[index], conf[index], cls[index])
+        i = index + len(self) if index < 0 else index
+        if not 0 <= i < len(self):
+            raise IndexError(f"box index {index} out of range for {len(self)}")
+        return _Boxes(xyxy[i:i + 1], conf[i:i + 1], cls[i:i + 1])
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
 
 
 class _Result:

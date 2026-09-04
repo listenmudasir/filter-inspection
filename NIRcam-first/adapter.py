@@ -78,11 +78,18 @@ class _Tensorish:
     def numpy(self):
         return self._array
 
+    def item(self):
+        return self._array.item()
+
     def __len__(self):
         return len(self._array)
 
+    def __iter__(self):
+        return iter(self._array)
+
     def __getitem__(self, item):
-        return self._array[item]
+        value = self._array[item]
+        return _Tensorish(value) if isinstance(value, np.ndarray) else value
 
 
 class _Boxes:
@@ -93,6 +100,24 @@ class _Boxes:
 
     def __len__(self):
         return len(self.xyxy)
+
+    # Iterable, and indexing yields a one-row _Boxes, matching ultralytics.
+    # The GUI does `for box in results[0].boxes: box.xyxy[0].cpu().numpy()`,
+    # so without these it raises "'_Boxes' object is not iterable" before it
+    # reaches its own emit calls -- and the display stays blank.
+    def __getitem__(self, index):
+        xyxy, conf, cls = (self.xyxy.numpy(), self.conf.numpy(),
+                           self.cls.numpy())
+        if isinstance(index, slice):
+            return _Boxes(xyxy[index], conf[index], cls[index])
+        i = index + len(self) if index < 0 else index
+        if not 0 <= i < len(self):
+            raise IndexError(f"box index {index} out of range for {len(self)}")
+        return _Boxes(xyxy[i:i + 1], conf[i:i + 1], cls[i:i + 1])
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
 
 
 class _Result:
