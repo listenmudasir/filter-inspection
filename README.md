@@ -23,6 +23,14 @@ pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorc
 pip install -r requirements.txt
 ```
 
+**On Blackwell (RTX 50-series) the cu121 pin above does not work** — it has no
+sm_120 kernels and every forward pass raises "no kernel image is available for
+execution on the device". Use a cu128 build there instead:
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+```
+
 **Copy the model weights.** `supervised_global.pt` is 262 MiB — above GitHub's
 100 MB per-file limit — so it is not in git:
 
@@ -38,13 +46,28 @@ python selftest.py      # must print PASSED
 
 ## 2. Run
 
+Activate the environment, then one command:
+
 ```bash
-cd NIRcam-first
-./run_gui.sh            # Linux    (run_gui.bat on Windows)
+conda activate nircam       # `filter-inspect` on the Windows line machine
+
+cd NIRcam-first && ./run_gui.sh      # Linux
+run.bat                              # Windows -- from the repo root
+run.bat test                         # Windows -- selftest.py
 ```
 
-**Use `run_gui.sh`, not `python BasicDemo.py`.** The launcher sanitises two
-environment problems that otherwise abort Qt — see §6.
+On Windows `run_gui.bat` uses whatever conda env is active (`%CONDA_PREFIX%`).
+With no env active it searches the usual conda roots for `%ENV_NAME%`
+(default `filter-inspect`), so double-clicking it still works. Override
+either:
+
+```bat
+set "ENV_NAME=some-other-env" && run.bat
+set "ENV_PY=C:\path\to\python.exe" && run.bat
+```
+
+**Use the launcher, not `python BasicDemo.py`.** It sanitises two environment
+problems that otherwise abort Qt — see §6.
 
 In the GUI: **查找設備** → **打開設備** → **載入模型** → **開始採集**.
 
@@ -172,6 +195,7 @@ filter-inspection/
 ├── inspection/
 │   └── enhance.py                crop_to_content + illumination_correct
 ├── weights/                      supervised_global.pt goes here (not in git)
+├── run.bat                       Windows entry point: `run.bat` / `run.bat test`
 ├── requirements.txt
 └── selftest.py
 ```
