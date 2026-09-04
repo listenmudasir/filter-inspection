@@ -3,6 +3,20 @@
 Water-filter cartridge surface AOI: Hikvision camera GUI + supervised defect
 segmentation, in one repository.
 
+> **Credits.** The camera GUI in `NIRcam-first/` is **not original work here**.
+> It comes from Robert Lee's project
+> [RobertLee0522/NIRcam-first](https://github.com/RobertLee0522/NIRcam-first) —
+> the PyQt5 UI, the Hikvision MVS integration, the TCP server, the tracker, the
+> Two-Band Filter and the boundary line filter are all his. This repository
+> vendors that code and adds a supervised segmentation model on top of it
+> (`supervised_detect.py`, `hybrid_detect.py`, `inspection/`).
+> `BOUNDARY_LINE_FILTER_ERN.md` and `claude.md` are ITRI team documents that
+> travelled with it.
+>
+> Upstream carries no licence file, so its terms are whatever Robert grants.
+> Ask him before redistributing this repository or the code under
+> `NIRcam-first/`.
+
 Clone → copy weights → `selftest.py` → run.
 
 ---
