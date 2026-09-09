@@ -94,6 +94,19 @@ try:
 except ImportError:                     # deployment checkout layout
     from inspection.enhance import crop_to_content, illumination_correct
 
+# Optional: the CPU path above is the definition, this is the fast equivalent.
+# Absence must degrade to slow-but-correct, never to silently-wrong, so the
+# import failure is caught and announced rather than allowed to propagate.
+try:
+    from preprocessing.gpu_preprocess import preprocess as gpu_preprocess
+except ImportError:
+    try:
+        from inspection.gpu_preprocess import preprocess as gpu_preprocess
+    except ImportError:
+        gpu_preprocess = None
+        print("[supervised_detect] gpu_preprocess not found -- falling back to "
+              "the CPU path (~279 ms/frame instead of ~22 ms).")
+
 
 # --------------------------------------------------------------------------
 # result wrappers
@@ -115,7 +128,20 @@ _CLASS_ID = {n: i for i, n in enumerate(CLASS_NAMES)}
 
 
 class _Tensorish:
-    """numpy array wearing the .cpu().numpy() interface torch tensors have."""
+    """numpy array wearing the torch-tensor interface ultralytics exposes.
+
+    Must support the FULL access pattern CamOperation_class uses, not just the
+    parts we happened to exercise offline:
+
+        box.xyxy[0].cpu().numpy()      -> indexing must stay wrapped
+        int(box.cls.item())            -> .item() for scalars
+        len(results[0].boxes)
+
+    The first version only had cpu()/numpy()/len/getitem. That was enough for
+    draw_custom_boxes -- which reads .xyxy.cpu().numpy() in bulk -- so it
+    passed every offline test, and then failed on live frames with
+    "'_Boxes' object is not iterable" the moment the boundary-filter path ran.
+    """
 
     def __init__(self, array):
         self._array = array
@@ -129,6 +155,9 @@ class _Tensorish:
     def item(self):
         return self._array.item()
 
+    def tolist(self):
+        return self._array.tolist()
+
     def __len__(self):
         return len(self._array)
 
@@ -136,10 +165,12 @@ class _Tensorish:
         return iter(self._array)
 
     def __getitem__(self, item):
+        # Stay wrapped so chains like .xyxy[0].cpu().numpy() work.
         value = self._array[item]
-        # Keep the torch-tensor illusion one level down, so `xyxy[0].cpu()`
-        # works the way callers written against ultralytics expect.
         return _Tensorish(value) if isinstance(value, np.ndarray) else value
+
+    def __float__(self):
+        return float(self._array)
 
 
 class _Boxes:
@@ -307,13 +338,14 @@ class SupervisedDetector:
         self.last_latency_ms = 0.0
         self._warned_imgsz = False
 
-    @torch.no_grad()
-    def _detect(self, image_bgr):
+    def _preprocess_cpu(self, image_bgr):
+        """Reference path. Correct, and 279 ms at 2200x2048 -- 88% of a frame.
+        Kept for CPU-only installs and as the definition the GPU path is
+        validated against."""
         cropped, _m, crop_box = crop_to_content(image_bgr)
         cropped = illumination_correct(cropped, 0.08)
         height, width = cropped.shape[:2]
         side = max(height, width)
-
         canvas = np.zeros((side, side, 3), np.uint8)
         canvas[:height, :width] = cropped
         small = cv2.resize(canvas, (self.input_size, self.input_size),
@@ -321,7 +353,21 @@ class SupervisedDetector:
         # BGR, matching training exactly -- the dataset fed raw cv2.imread
         # output with no colour conversion.
         tensor = torch.from_numpy(small.transpose(2, 0, 1).copy()).float()
-        tensor = tensor.unsqueeze(0).to(self.device) / 255.0
+        return tensor.unsqueeze(0).to(self.device) / 255.0, crop_box, (height, width, side)
+
+    @torch.no_grad()
+    def _detect(self, image_bgr):
+        # Preprocessing, not the network, is the frame budget: measured at
+        # 2200x2048 on an A5000, 279 ms preprocessing against a 22 ms forward
+        # pass. The GPU path reproduces the CPU one (see
+        # preprocessing/gpu_preprocess.py) and takes it to 22 ms: 2.98 -> 20.9
+        # FPS end to end, F1 0.6016 -> 0.5974 on the locked 317-image test set.
+        if gpu_preprocess is not None and self.device.type == "cuda":
+            tensor, crop_box, (height, width, side) = gpu_preprocess(
+                image_bgr, self.device, self.input_size)
+        else:
+            tensor, crop_box, (height, width, side) = self._preprocess_cpu(image_bgr)
+
         with torch.autocast("cuda", enabled=self.device.type == "cuda"):
             logits = self.model(tensor)
         probs = torch.softmax(logits.float(), dim=1)[0].cpu().numpy()

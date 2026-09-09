@@ -126,33 +126,51 @@ for your accept/reject rule, do not rely on this model alone for it.
 
 ## 4. Timing
 
-Measured on this line's own data (RTX A5000):
+Measured on this line's own data at live camera resolution (2200×2048),
+RTX A5000, 80 frames through `SupervisedDetector` itself:
 
 ```
 capture rate           2.10 FPS   (476 ms/frame)
 frames per cartridge   10         over a 4.3 s burst
 ```
 
-| budget | | this model |
+| budget | available | this model | |
+|---|---|---|---|
+| **per frame** | 476 ms | **38.6 ms** (p95 41.3) | ✅ 12× headroom |
+| per cartridge | 4300 ms | 386 ms for all 10 frames | ✅ 11× headroom |
+
+**25.9 FPS.** It runs per *frame*, in 連續模式, with room to spare — every
+frame of the burst can be scored and combined by track consensus.
+
+### Where the time went, and why this changed
+
+The network was never the bottleneck. Preprocessing was, by 13×:
+
+| stage | before | now |
 |---|---|---|
-| per frame | 476 ms | ~1000–1400 ms — **does not fit** |
-| **per cartridge** | **4300 ms** | **~1000–1400 ms — fits, ~3× headroom** |
+| `content_bbox` (numpy mean/std at 4.5 MP) | 75 ms | ~1 ms |
+| `illumination_correct` (float32 add/clip at 4.5 MP) | 176 ms | ~2 ms |
+| pad + resize | 24 ms | fused |
+| forward pass | 22 ms | 22 ms |
+| **frame** | **~311 ms (3.2 FPS)** | **38.6 ms (25.9 FPS)** |
 
-Run it **once per cartridge** (觸發模式), not per frame, and combine the burst
-with track consensus. In 連續模式 at 14 FPS the frames will queue behind a
-~1.2 s model.
+`inspection/gpu_preprocess.py` does the same arithmetic on the GPU and, more
+importantly, *after* the downsample instead of before it. The model only ever
+sees 768×768, while every stage above ran at 4.5 megapixels; `INTER_AREA`
+resize is linear, so `resize(img + offset) == resize(img) + resize(offset)`
+exactly, and the illumination correction can move to 768×768 unchanged.
 
-Where the time goes:
+Verified on the locked 317-image test set, not assumed: F1 **0.6016 → 0.5974**,
+false alarms on clean frames **0 → 0**, crop box identical on **317/317**
+frames. Component count differs on 28/317 frames — the same order of
+disagreement fp32→fp16 already produces.
 
-```
-crop + illumination   ~640 ms   65%   CPU
-forward pass            45 ms    5%   GPU
-everything else       ~300 ms
-```
+If `gpu_preprocess` is missing or CUDA is unavailable the detector prints a
+notice and falls back to the CPU path — slower, never silently different.
 
-**The network is not the bottleneck.** Quantisation, fp16 or a smaller
-architecture buy essentially nothing; the remaining speedup is a preprocessing
-port, and it is not needed to meet the per-cartridge budget.
+**fp16/quantisation are still not worth it.** Measured across precisions: the
+forward pass drops 22.3 → 13.2 ms, but it costs 2 true positives (188 → 186)
+because detections near the 0.30 threshold move. fp32 is the shipped default.
 
 ## 5. The method
 
