@@ -587,11 +587,24 @@ if __name__ == "__main__":
             QMessageBox.warning(mainWindow, "Error", "Save BMP failed", QMessageBox.Ok)
 
     def get_param():
-        ret = obj_cam_operation.Get_parameter()
-        if ret == 0:
-            ui.edtExposureTime.setText(f"{obj_cam_operation.exposure_time:.2f}")
-            ui.edtGain.setText(f"{obj_cam_operation.gain:.2f}")
-            ui.edtFrameRate.setText(f"{obj_cam_operation.frame_rate:.2f}")
+        # 這裡原本是 `if ret == 0:` 包住三個 setText。Get_parameter 只要有
+        # 任何一個節點讀失敗就提前 return 錯誤碼，三格全部不更新、也不報錯，
+        # 所以 Exposure / Gain / Frame Rate 永遠顯示 0。現在讀到什麼就顯示
+        # 什麼，讀不到的維持原值。
+        if obj_cam_operation in (0, None):
+            return
+        obj_cam_operation.Get_parameter()
+        ui.edtExposureTime.setText(f"{obj_cam_operation.exposure_time:.2f}")
+        ui.edtGain.setText(f"{obj_cam_operation.gain:.2f}")
+        ui.edtFrameRate.setText(f"{obj_cam_operation.frame_rate:.2f}")
+
+        # 幀率可能來自兩個不同意義的節點，滑過去就知道是哪一個。
+        source = getattr(obj_cam_operation, "frame_rate_source", None)
+        if source:
+            ui.edtFrameRate.setToolTip(
+                f"{source} — "
+                + ("相機實際輸出的幀率" if source == "ResultingFrameRate"
+                   else "使用者設定的幀率上限"))
 
     def set_param():
         ret = obj_cam_operation.Set_parameter(ui.edtFrameRate.text(), ui.edtExposureTime.text(), ui.edtGain.text())
@@ -694,7 +707,10 @@ if __name__ == "__main__":
         """更新「TCP控制」頁面的辨識結果文字"""
         ui.detectionResultText.setText(result_string)
     # --- 主程式 ---
-    app = QApplication(sys.argv)
+    # Reuse an existing instance if one is already running. nircam_launcher.pyw
+    # creates the QApplication first so it can put a splash screen up while
+    # the 262 MB model loads; constructing a second QApplication would raise.
+    app = QApplication.instance() or QApplication(sys.argv)
     mainWindow = QMainWindow()
     ui = Ui_MainWindow()
     ui.setupUi(mainWindow)

@@ -343,6 +343,9 @@ class CameraOperation:
         self.frame_rate = frame_rate
         self.exposure_time = exposure_time
         self.gain = gain
+        # 幀率是從哪個節點讀來的：設定值 AcquisitionFrameRate，或相機實際
+        # 輸出的 ResultingFrameRate。GUI 用它來標示顯示的是哪一個。
+        self.frame_rate_source = None
         self.buf_lock = threading.Lock()
         
         # ========== Two-Band Filter 觸發系統 ==========
@@ -509,32 +512,64 @@ class CameraOperation:
         if self.b_open_device:
             return self.obj_cam.MV_CC_SetCommandValue("TriggerSoftware")
 
+    def _read_float_node(self, *names):
+        """讀第一個讀得到的 GenICam float 節點，回傳 (值, 節點名)。
+
+        全部失敗才回傳 (None, 最後的錯誤碼)。分開讀是重點：原本三個節點
+        串在一起、任何一個失敗就整個 return，於是 GUI 三格全部停在 0。
+        """
+        last_ret = MV_OK
+        for name in names:
+            stParam = MVCC_FLOATVALUE()
+            memset(byref(stParam), 0, sizeof(MVCC_FLOATVALUE))
+            ret = self.obj_cam.MV_CC_GetFloatValue(name, stParam)
+            if ret == 0:
+                return stParam.fCurValue, name
+            last_ret = ret
+        return None, last_ret
+
     def Get_parameter(self):
-        """獲取參數"""
-        if self.b_open_device:
-            stFloatParam_FrameRate = MVCC_FLOATVALUE()
-            memset(byref(stFloatParam_FrameRate), 0, sizeof(MVCC_FLOATVALUE))
-            stFloatParam_exposureTime = MVCC_FLOATVALUE()
-            memset(byref(stFloatParam_exposureTime), 0, sizeof(MVCC_FLOATVALUE))
-            stFloatParam_gain = MVCC_FLOATVALUE()
-            memset(byref(stFloatParam_gain), 0, sizeof(MVCC_FLOATVALUE))
+        """獲取曝光、增益與幀率。
 
-            ret = self.obj_cam.MV_CC_GetFloatValue("AcquisitionFrameRate", stFloatParam_FrameRate)
-            if ret != 0:
-                return ret
-            self.frame_rate = stFloatParam_FrameRate.fCurValue
+        每個節點各自讀取，讀到什麼就更新什麼 —— 相機不支援或當下不可讀的
+        節點不會再把其他兩個一起拖下水。
 
-            ret = self.obj_cam.MV_CC_GetFloatValue("ExposureTime", stFloatParam_exposureTime)
-            if ret != 0:
-                return ret
-            self.exposure_time = stFloatParam_exposureTime.fCurValue
+        幀率優先讀 AcquisitionFrameRate（使用者設定值，Set_parameter 寫的
+        也是它）；該節點在 AcquisitionFrameRateEnable 關閉時可能不可讀，
+        這時退而讀 ResultingFrameRate —— 相機實際輸出的幀率，永遠可讀，
+        對操作員來說反而是更有意義的數字。
+        """
+        if not self.b_open_device:
+            return MV_E_CALLORDER
 
-            ret = self.obj_cam.MV_CC_GetFloatValue("Gain", stFloatParam_gain)
-            if ret != 0:
-                return ret
-            self.gain = stFloatParam_gain.fCurValue
+        failures = []
 
-            return MV_OK
+        value, source = self._read_float_node("ExposureTime")
+        if value is None:
+            failures.append(f"ExposureTime (0x{source & 0xFFFFFFFF:08X})")
+        else:
+            self.exposure_time = value
+
+        value, source = self._read_float_node("Gain")
+        if value is None:
+            failures.append(f"Gain (0x{source & 0xFFFFFFFF:08X})")
+        else:
+            self.gain = value
+
+        value, source = self._read_float_node("AcquisitionFrameRate",
+                                              "ResultingFrameRate")
+        if value is None:
+            failures.append(f"FrameRate (0x{source & 0xFFFFFFFF:08X})")
+        else:
+            self.frame_rate = value
+            self.frame_rate_source = source
+
+        if failures:
+            # 原本這裡是靜默的：讀不到就什麼都不做，GUI 停在 0 而沒有任何
+            # 訊息，看起來像「這個功能從來沒運作過」。
+            print("[參數] 讀取失敗: " + ", ".join(failures))
+
+        return MV_OK
 
     def Set_parameter(self, frameRate, exposureTime, gain):
         """設置參數"""
