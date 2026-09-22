@@ -887,9 +887,8 @@ class CameraOperation:
                                 # ========================================
                                 # 邊界線過濾與 TCP 傳送（不使用觸發系統）
                                 # ========================================
-                                image_height = self.st_frame_info.nHeight
-                                image_width = self.st_frame_info.nWidth
-                                
+                                image_height, image_width = image_rgb.shape[:2]
+
                                 # 計算邊界線的像素位置
                                 top_line_y = int(image_height * boundary_line_top)
                                 bottom_line_y = int(image_height * boundary_line_bottom)
@@ -937,8 +936,7 @@ class CameraOperation:
                             
                             # 計算邊界線位置（如果還沒計算）
                             if 'image_height' not in locals():
-                                image_height = self.st_frame_info.nHeight
-                                image_width = self.st_frame_info.nWidth
+                                image_height, image_width = image_rgb.shape[:2]
                                 top_line_y = int(image_height * boundary_line_top)
                                 bottom_line_y = int(image_height * boundary_line_bottom)
                             

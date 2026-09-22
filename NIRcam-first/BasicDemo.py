@@ -2,7 +2,7 @@
 
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import QTimer, QObject, pyqtSignal, Qt
-from PyQt5.QtGui import QImage, QPixmap, QIntValidator
+from PyQt5.QtGui import QImage, QPixmap
 from CamOperation_class import CameraOperation, describe_open_error
 from MvImport.MvCameraControl_class import *
 from MvImport.MvErrorDefine_const import *
@@ -371,12 +371,23 @@ if __name__ == "__main__":
         return ret
 
     def apply_manual_image_shape():
-        """套用手動輸入的影像寬高覆寫；留空任一欄位則清除覆寫。"""
+        """套用手動輸入的影像寬高覆寫；留空、非數字或非正數視為清除覆寫。"""
         width_text = ui.edtShapeWidth.text().strip()
         height_text = ui.edtShapeHeight.text().strip()
 
-        width = int(width_text) if width_text else None
-        height = int(height_text) if height_text else None
+        try:
+            width = int(width_text) if width_text else None
+        except ValueError:
+            width = None
+        try:
+            height = int(height_text) if height_text else None
+        except ValueError:
+            height = None
+
+        if width is not None and width <= 0:
+            width = None
+        if height is not None and height <= 0:
+            height = None
 
         set_manual_image_shape(width, height)
 
@@ -685,7 +696,6 @@ if __name__ == "__main__":
     shape_width_layout.addWidget(QLabel("寬度:"))
     ui.edtShapeWidth = QLineEdit()
     ui.edtShapeWidth.setPlaceholderText("留空 = 使用相機回報值")
-    ui.edtShapeWidth.setValidator(QIntValidator(1, 100000, ui.edtShapeWidth))
     shape_width_layout.addWidget(ui.edtShapeWidth)
     shape_override_layout.addLayout(shape_width_layout)
 
@@ -693,7 +703,6 @@ if __name__ == "__main__":
     shape_height_layout.addWidget(QLabel("高度:"))
     ui.edtShapeHeight = QLineEdit()
     ui.edtShapeHeight.setPlaceholderText("留空 = 使用相機回報值")
-    ui.edtShapeHeight.setValidator(QIntValidator(1, 100000, ui.edtShapeHeight))
     shape_height_layout.addWidget(ui.edtShapeHeight)
     shape_override_layout.addLayout(shape_height_layout)
 
