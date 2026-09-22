@@ -101,11 +101,11 @@ _EN = {
     "停止": "Stop",
     "TCP: 未連接": "TCP: not connected",
 
-    # shared memory
-    "共享記憶體": "Shared Memory",
-    "手動分享": "Share Once",
-    "自動分享": "Auto share",
-    "未啟動": "Not started",
+    # image shape override
+    "影像尺寸覆寫": "Image Shape Override",
+    "寬度:": "Width:",
+    "高度:": "Height:",
+    "未覆寫（使用相機回報值）": "Not overridden (using camera-reported value)",
 
     # image saving
     "圖片儲存設定": "Image Save Settings",
@@ -131,11 +131,7 @@ TEMPLATES = {
         "TCP: LabVIEW connected ({count} triggers)",
     "TCP: 等待LabVIEW連接...": "TCP: waiting for LabVIEW...",
     "TCP: 伺服器未啟動": "TCP: server not started",
-    "共享記憶體: 已啟動 (已傳送 {count} 幀)":
-        "Shared memory: running ({count} frames sent)",
-    "共享記憶體: 已啟動 (狀態未知)":
-        "Shared memory: running (state unknown)",
-    "共享記憶體: 未啟動": "Shared memory: not started",
+    "已覆寫: {width} x {height}": "Overridden: {width} x {height}",
     "目前邊界線: 上線 {top}%, 下線 {bottom}%":
         "Boundaries: top {top}%, bottom {bottom}%",
 }

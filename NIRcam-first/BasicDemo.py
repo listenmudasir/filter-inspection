@@ -392,10 +392,11 @@ if __name__ == "__main__":
         set_manual_image_shape(width, height)
 
         if width and height:
-            ui.lblShapeOverrideStatus.setText(f"已覆寫: {width} x {height}")
+            ui.lblShapeOverrideStatus.setText(
+                i18n.tr_fmt("已覆寫: {width} x {height}", width=width, height=height))
             ui.lblShapeOverrideStatus.setStyleSheet("color: green; font-size: 10px;")
         else:
-            ui.lblShapeOverrideStatus.setText("未覆寫（使用相機回報值）")
+            ui.lblShapeOverrideStatus.setText(i18n.tr("未覆寫（使用相機回報值）"))
             ui.lblShapeOverrideStatus.setStyleSheet("color: gray; font-size: 10px;")
 
     def select_save_path():
@@ -783,6 +784,10 @@ if __name__ == "__main__":
                 "目前邊界線: 上線 {top}%, 下線 {bottom}%",
                 top=ui.edtTopLinePercent.text(),
                 bottom=ui.edtBottomLinePercent.text()))
+        except (AttributeError, RuntimeError):
+            pass
+        try:
+            apply_manual_image_shape()
         except (AttributeError, RuntimeError):
             pass
 

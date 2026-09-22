@@ -55,9 +55,10 @@ except ImportError:
 ai_model = None  # 在這邊先定義一個全域變數
 
 # 手動覆寫取像時使用的影像寬高。兩者皆為正數時才生效，否則使用相機回報的
-# st_frame_info.nWidth/nHeight（見 set_manual_image_shape）。
-manual_image_width = None
-manual_image_height = None
+# st_frame_info.nWidth/nHeight（見 set_manual_image_shape）。存成單一 tuple
+# 而非兩個獨立變數，這樣 GUI 執行緒的寫入對取像執行緒的讀取來說是單次、
+# 原子性的操作，不會讀到「寬已更新、高還沒」的中間狀態。
+manual_image_shape = (None, None)
 
 # 新增：獲取AI參數的函數參考
 get_ai_parameters_func = None
@@ -260,9 +261,8 @@ def Color_numpy(data, nWidth, nHeight):
     return numArray
 def set_manual_image_shape(width, height):
     """設定手動覆寫的取像寬高。傳入 None 或 0 代表清除覆寫（改用相機回報值）。"""
-    global manual_image_width, manual_image_height
-    manual_image_width = width if width else None
-    manual_image_height = height if height else None
+    global manual_image_shape
+    manual_image_shape = (width if width else None, height if height else None)
 
 
 # 開啟設備時要求的像素格式。相機支援 Mono8/10/12、RGB8_Packed、BGR8_Packed、
@@ -678,8 +678,7 @@ class CameraOperation:
         包含：
         1. 影像獲取與轉換
         2. AI 辨識處理
-        3. 共享記憶體自動發送
-        4. 信號發送（更新UI）
+        3. 信號發送（更新UI）
         """
         stFrameInfo = MV_FRAME_OUT_INFO_EX()
     
@@ -739,11 +738,13 @@ class CameraOperation:
                     # 第一步：影像格式轉換（從 Bayer/Mono 轉為 RGB）
                     # ========================================
                     try:
+                        # 單次讀取 tuple，避免讀到寬已更新、高還沒更新的中間狀態。
+                        override_width, override_height = manual_image_shape
                         nH, nW = resolve_capture_shape(
                             self.st_frame_info.nHeight,
                             self.st_frame_info.nWidth,
-                            manual_image_width,
-                            manual_image_height,
+                            override_width,
+                            override_height,
                         )
                         enPT = self.st_frame_info.enPixelType
 
