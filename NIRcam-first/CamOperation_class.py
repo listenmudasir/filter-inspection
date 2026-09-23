@@ -21,7 +21,12 @@ import ctypes
 import random
 from ctypes import *
 import cv2
-from image_shape import resolve_capture_shape, decode_raw_frame
+from image_shape import (
+    resolve_capture_shape,
+    decode_raw_frame,
+    is_high_bandwidth_pixel_type,
+    pixel_type_bytes_per_pixel,
+)
 
 sys.path.append("../MvImport")
 
@@ -334,6 +339,10 @@ class CameraOperation:
         self.b_save_jpg = b_save_jpg
         self.buf_grab_image = None
         self.buf_grab_image_size = 0
+        # High Bandwidth 解碼的輸出緩衝區。每幀重新配置 5MB 太浪費，
+        # 沿用 buf_grab_image 的做法：只有在不夠大時才重新配置。
+        self.buf_hb_decode = None
+        self.buf_hb_decode_size = 0
         self.buf_save_image = buf_save_image
         self.n_save_image_size = n_save_image_size
         self.h_thread_handle = h_thread_handle
@@ -672,6 +681,38 @@ class CameraOperation:
     
     # =================================================
 
+    def _hb_decode_frame(self, enPixelType, nH, nW):
+        """把 High Bandwidth（無損壓縮）幀解回原始像素資料。
+
+        回傳 (緩衝區, 解碼後的像素格式)；失敗時回傳 None，呼叫端應跳過此幀。
+
+        解碼後的大小用 nW*nH*每像素位元組數 推算（HB 旗標在 bit 31，不影響
+        PFNC 值裡的位元深度欄位），緩衝區沿用 buf_grab_image 的做法快取重用，
+        避免每秒二十幾幀都重新配置 5MB。
+        """
+        needed = nW * nH * pixel_type_bytes_per_pixel(enPixelType)
+        if self.buf_hb_decode is None or self.buf_hb_decode_size < needed:
+            self.buf_hb_decode = (c_ubyte * needed)()
+            self.buf_hb_decode_size = needed
+
+        stDecodeParam = MV_CC_HB_DECODE_PARAM()
+        memset(byref(stDecodeParam), 0, sizeof(stDecodeParam))
+        stDecodeParam.pSrcBuf = cast(self.buf_grab_image, POINTER(c_ubyte))
+        stDecodeParam.nSrcLen = self.st_frame_info.nFrameLen
+        stDecodeParam.nWidth = nW
+        stDecodeParam.nHeight = nH
+        stDecodeParam.pDstBuf = cast(self.buf_hb_decode, POINTER(c_ubyte))
+        stDecodeParam.nDstBufSize = self.buf_hb_decode_size
+
+        ret = self.obj_cam.MV_CC_HBDecode(stDecodeParam)
+        if ret != MV_OK:
+            print(f"[HB] MV_CC_HB_Decode failed: 0x{ret:08X} "
+                  f"(src={self.st_frame_info.nFrameLen} bytes, "
+                  f"dst buffer={self.buf_hb_decode_size} bytes)")
+            return None
+
+        return self.buf_hb_decode, stDecodeParam.enDstPixelType
+
     def Work_thread(self, signals):
         """
         相機取圖線程函數 - 完整版本
@@ -747,6 +788,17 @@ class CameraOperation:
                             override_height,
                         )
                         enPT = self.st_frame_info.enPixelType
+                        frame_buffer = self.buf_grab_image
+
+                        # High Bandwidth（無損壓縮傳輸）格式的 payload 是壓縮過
+                        # 的，長度也不是 nW*nH 的整數倍。直接當成原始 Bayer
+                        # reshape 只會得到雜訊，必須先用 SDK 的 MV_CC_HB_Decode
+                        # 還原，之後才照解碼後回報的真實格式往下走。
+                        if is_high_bandwidth_pixel_type(enPT):
+                            decoded = self._hb_decode_frame(enPT, nH, nW)
+                            if decoded is None:
+                                continue
+                            frame_buffer, enPT = decoded
 
                         # RGB8/BGR8 Packed：相機端已經做完 debayer，每像素 3 bytes。
                         # 這種格式不能走下面的單通道 reshape（會直接丟
@@ -755,7 +807,7 @@ class CameraOperation:
                         if enPT in (PixelType_Gvsp_RGB8_Packed,
                                     PixelType_Gvsp_BGR8_Packed):
                             packed = np.frombuffer(
-                                self.buf_grab_image, dtype=np.uint8,
+                                frame_buffer, dtype=np.uint8,
                                 count=nH * nW * 3).reshape(nH, nW, 3)
                             if enPT == PixelType_Gvsp_BGR8_Packed:
                                 image_rgb = cv2.cvtColor(packed, cv2.COLOR_BGR2RGB)
@@ -767,31 +819,31 @@ class CameraOperation:
                             # np.asarray(self.buf_grab_image) 那樣把整個依
                             # PayloadSize 配置、可能大於實際幀長度的緩衝區拿去
                             # reshape（那正是原本 reshape 崩潰的原因）。
-                            raw_image = decode_raw_frame(self.buf_grab_image, nH, nW)
+                            raw_image = decode_raw_frame(frame_buffer, nH, nW)
 
                             # 根據像素格式進行轉換
-                            if Is_color_data(self.st_frame_info.enPixelType):
+                            if Is_color_data(enPT):
                                 # 彩色圖像 - 從 Bayer 格式直接轉換為 RGB
                                 # 注意：嘗試使用 BG 格式來修正紅藍通道互換問題
-                                if self.st_frame_info.enPixelType == PixelType_Gvsp_BayerRG8:
+                                if enPT == PixelType_Gvsp_BayerRG8:
                                     # RG8 使用 BG2RGB 轉換（紅藍互換）
                                     image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_BG2RGB)
-                                elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerGR8:
+                                elif enPT == PixelType_Gvsp_BayerGR8:
                                     # GR8 使用 GB2RGB 轉換（紅藍互換）
                                     image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_GB2RGB)
-                                elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerGB8:
+                                elif enPT == PixelType_Gvsp_BayerGB8:
                                     # GB8 使用 GR2RGB 轉換（紅藍互換）
                                     image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_GR2RGB)
-                                elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerBG8:
+                                elif enPT == PixelType_Gvsp_BayerBG8:
                                     # BG8 使用 RG2RGB 轉換（紅藍互換）
                                     image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_RG2RGB)
                                 else:
                                     # 默認使用 BG8（而不是 RG8）
                                     image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_BG2RGB)
-                            elif Is_mono_data(self.st_frame_info.enPixelType):
+                            elif Is_mono_data(enPT):
                                 # 單色影像轉換為 3 通道供後續處理
                                 mono_array = Mono_numpy(
-                                    self.buf_save_image,
+                                    frame_buffer,
                                     nW,
                                     nH
                                 )
@@ -799,7 +851,8 @@ class CameraOperation:
                                 image_rgb = cv2.cvtColor(mono_array.squeeze(), cv2.COLOR_GRAY2RGB)
                             else:
                                 # 未知格式，跳過此幀
-                                print(f"Unsupported pixel format: {self.st_frame_info.enPixelType}")
+                                print(f"Unsupported pixel format: {self.st_frame_info.enPixelType} "
+                                      f"(0x{self.st_frame_info.enPixelType:08X})")
                                 continue
 
                     except Exception as e:

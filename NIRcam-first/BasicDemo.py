@@ -1,5 +1,10 @@
 # -- coding: utf-8 --
 
+# 必須在任何其他 import 之前：底下的 import 本身就會 print（模型載入失敗、
+# 缺少模組的警告等），那些是最需要留在記錄檔裡的訊息。
+from session_log import start_session_log
+start_session_log()
+
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import QTimer, QObject, pyqtSignal, Qt
 from PyQt5.QtGui import QImage, QPixmap

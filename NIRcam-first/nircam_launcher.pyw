@@ -141,8 +141,13 @@ class Splash:
         log.write(f"\n{'=' * 70}\nlaunched "
                   f"{_dt.datetime.now():%Y-%m-%d %H:%M:%S}\n{'=' * 70}\n")
         try:
+            # -u: without it Python block-buffers a redirected stdout, so this
+            # log sits empty for minutes and loses whatever is still buffered
+            # if the process is killed. BasicDemo.py keeps its own log too
+            # (session_log.py); this one captures anything that dies before
+            # that gets installed.
             self.proc = subprocess.Popen(
-                [sys.executable, "-s", "BasicDemo.py"],
+                [sys.executable, "-s", "-u", "BasicDemo.py"],
                 cwd=HERE, env=child_environment(),
                 stdout=log, stderr=log,
                 creationflags=subprocess.CREATE_NO_WINDOW)
