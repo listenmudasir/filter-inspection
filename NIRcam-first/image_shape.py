@@ -28,18 +28,3 @@ def decode_raw_frame(buffer, height, width):
     "cannot reshape array of size N into shape (H, W)").
     """
     return np.frombuffer(buffer, dtype=np.uint8, count=height * width).reshape(height, width)
-
-
-def normalize_pixel_type(en_pixel_type):
-    """Strip the vendor "custom" flag bit (bit 31 / 0x80000000) some cameras
-    OR into an otherwise-standard GenICam PFNC PixelType value.
-
-    Observed in production: a camera configured as BayerRG8 (0x01080009)
-    reported frames with enPixelType=2164785161 (0x81080009) — the same
-    value with bit 31 set — which meant none of the exact-equality pixel
-    format comparisons in CamOperation_class.py recognized it, so every
-    frame was silently skipped as "Unsupported pixel format". The extra bit
-    does not change the underlying pixel layout, so masking it off before
-    comparing against the known PixelType_Gvsp_* constants is safe.
-    """
-    return en_pixel_type & 0x7FFFFFFF

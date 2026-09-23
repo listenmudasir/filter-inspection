@@ -21,7 +21,7 @@ import ctypes
 import random
 from ctypes import *
 import cv2
-from image_shape import resolve_capture_shape, decode_raw_frame, normalize_pixel_type
+from image_shape import resolve_capture_shape, decode_raw_frame
 
 sys.path.append("../MvImport")
 
@@ -746,11 +746,7 @@ class CameraOperation:
                             override_width,
                             override_height,
                         )
-                        # 有些相機/韌體會在標準 PixelType 上多 OR 一個
-                        # bit 31 (0x80000000)，底層像素排列不變，但會讓
-                        # 下面的精確比對全部對不上、每一幀都被當成
-                        # unsupported 格式跳過。比對前先遮掉這個位元。
-                        enPT = normalize_pixel_type(self.st_frame_info.enPixelType)
+                        enPT = self.st_frame_info.enPixelType
 
                         # RGB8/BGR8 Packed：相機端已經做完 debayer，每像素 3 bytes。
                         # 這種格式不能走下面的單通道 reshape（會直接丟
@@ -774,25 +770,25 @@ class CameraOperation:
                             raw_image = decode_raw_frame(self.buf_grab_image, nH, nW)
 
                             # 根據像素格式進行轉換
-                            if Is_color_data(enPT):
+                            if Is_color_data(self.st_frame_info.enPixelType):
                                 # 彩色圖像 - 從 Bayer 格式直接轉換為 RGB
                                 # 注意：嘗試使用 BG 格式來修正紅藍通道互換問題
-                                if enPT == PixelType_Gvsp_BayerRG8:
+                                if self.st_frame_info.enPixelType == PixelType_Gvsp_BayerRG8:
                                     # RG8 使用 BG2RGB 轉換（紅藍互換）
                                     image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_BG2RGB)
-                                elif enPT == PixelType_Gvsp_BayerGR8:
+                                elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerGR8:
                                     # GR8 使用 GB2RGB 轉換（紅藍互換）
                                     image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_GB2RGB)
-                                elif enPT == PixelType_Gvsp_BayerGB8:
+                                elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerGB8:
                                     # GB8 使用 GR2RGB 轉換（紅藍互換）
                                     image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_GR2RGB)
-                                elif enPT == PixelType_Gvsp_BayerBG8:
+                                elif self.st_frame_info.enPixelType == PixelType_Gvsp_BayerBG8:
                                     # BG8 使用 RG2RGB 轉換（紅藍互換）
                                     image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_RG2RGB)
                                 else:
                                     # 默認使用 BG8（而不是 RG8）
                                     image_rgb = cv2.cvtColor(raw_image, cv2.COLOR_BAYER_BG2RGB)
-                            elif Is_mono_data(enPT):
+                            elif Is_mono_data(self.st_frame_info.enPixelType):
                                 # 單色影像轉換為 3 通道供後續處理
                                 mono_array = Mono_numpy(
                                     self.buf_save_image,
@@ -803,8 +799,7 @@ class CameraOperation:
                                 image_rgb = cv2.cvtColor(mono_array.squeeze(), cv2.COLOR_GRAY2RGB)
                             else:
                                 # 未知格式，跳過此幀
-                                print(f"Unsupported pixel format: {self.st_frame_info.enPixelType} "
-                                      f"(normalized: {enPT})")
+                                print(f"Unsupported pixel format: {self.st_frame_info.enPixelType}")
                                 continue
 
                     except Exception as e:
