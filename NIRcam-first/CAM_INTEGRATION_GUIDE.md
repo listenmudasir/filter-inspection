@@ -134,8 +134,6 @@ class MainWindow(QMainWindow):
     ↓
 影像轉換（Bayer/Mono → BGR）
     ↓
-共享記憶體發送（可選）
-    ↓
 YOLO 偵測
     ↓
 ┌─────────────────────────────────────┐

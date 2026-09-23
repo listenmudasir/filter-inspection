@@ -21,7 +21,7 @@ import ctypes
 import random
 from ctypes import *
 import cv2
-from shared_memory_sender import SharedMemorySender
+from image_shape import resolve_capture_shape, decode_raw_frame
 
 sys.path.append("../MvImport")
 
@@ -54,9 +54,11 @@ except ImportError:
 
 ai_model = None  # 在這邊先定義一個全域變數
 
-# 在類的開頭添加全局變量引用
-shared_memory_sender = None
-auto_share_enabled = False
+# 手動覆寫取像時使用的影像寬高。兩者皆為正數時才生效，否則使用相機回報的
+# st_frame_info.nWidth/nHeight（見 set_manual_image_shape）。存成單一 tuple
+# 而非兩個獨立變數，這樣 GUI 執行緒的寫入對取像執行緒的讀取來說是單次、
+# 原子性的操作，不會讀到「寬已更新、高還沒」的中間狀態。
+manual_image_shape = (None, None)
 
 # 新增：獲取AI參數的函數參考
 get_ai_parameters_func = None
@@ -257,15 +259,10 @@ def Color_numpy(data, nWidth, nHeight):
     numArray[:, :, 1] = data_g_arr
     numArray[:, :, 2] = data_b_arr
     return numArray
-def set_shared_memory_sender(sender):
-    """設置共享記憶體發送器"""
-    global shared_memory_sender
-    shared_memory_sender = sender
-
-def set_auto_share(enabled):
-    """設置是否自動分享圖像"""
-    global auto_share_enabled
-    auto_share_enabled = enabled
+def set_manual_image_shape(width, height):
+    """設定手動覆寫的取像寬高。傳入 None 或 0 代表清除覆寫（改用相機回報值）。"""
+    global manual_image_shape
+    manual_image_shape = (width if width else None, height if height else None)
 
 
 # 開啟設備時要求的像素格式。相機支援 Mono8/10/12、RGB8_Packed、BGR8_Packed、
@@ -681,8 +678,7 @@ class CameraOperation:
         包含：
         1. 影像獲取與轉換
         2. AI 辨識處理
-        3. 共享記憶體自動發送
-        4. 信號發送（更新UI）
+        3. 信號發送（更新UI）
         """
         stFrameInfo = MV_FRAME_OUT_INFO_EX()
     
@@ -742,8 +738,14 @@ class CameraOperation:
                     # 第一步：影像格式轉換（從 Bayer/Mono 轉為 RGB）
                     # ========================================
                     try:
-                        nH = self.st_frame_info.nHeight
-                        nW = self.st_frame_info.nWidth
+                        # 單次讀取 tuple，避免讀到寬已更新、高還沒更新的中間狀態。
+                        override_width, override_height = manual_image_shape
+                        nH, nW = resolve_capture_shape(
+                            self.st_frame_info.nHeight,
+                            self.st_frame_info.nWidth,
+                            override_width,
+                            override_height,
+                        )
                         enPT = self.st_frame_info.enPixelType
 
                         # RGB8/BGR8 Packed：相機端已經做完 debayer，每像素 3 bytes。
@@ -761,9 +763,11 @@ class CameraOperation:
                                 image_rgb = packed.copy()
 
                         else:
-                            raw_image = np.asarray(self.buf_grab_image).reshape(
-                                (nH, nW)
-                            )
+                            # decode_raw_frame 只讀取 nH*nW 個 bytes，不會像
+                            # np.asarray(self.buf_grab_image) 那樣把整個依
+                            # PayloadSize 配置、可能大於實際幀長度的緩衝區拿去
+                            # reshape（那正是原本 reshape 崩潰的原因）。
+                            raw_image = decode_raw_frame(self.buf_grab_image, nH, nW)
 
                             # 根據像素格式進行轉換
                             if Is_color_data(self.st_frame_info.enPixelType):
@@ -787,9 +791,9 @@ class CameraOperation:
                             elif Is_mono_data(self.st_frame_info.enPixelType):
                                 # 單色影像轉換為 3 通道供後續處理
                                 mono_array = Mono_numpy(
-                                    self.buf_save_image, 
-                                    self.st_frame_info.nWidth, 
-                                    self.st_frame_info.nHeight
+                                    self.buf_save_image,
+                                    nW,
+                                    nH
                                 )
                                 # 單色轉 RGB（三個通道相同）
                                 image_rgb = cv2.cvtColor(mono_array.squeeze(), cv2.COLOR_GRAY2RGB)
@@ -797,40 +801,13 @@ class CameraOperation:
                                 # 未知格式，跳過此幀
                                 print(f"Unsupported pixel format: {self.st_frame_info.enPixelType}")
                                 continue
-                        
+
                     except Exception as e:
                         print(f"Image conversion error: {e}")
                         continue
                     
                     # ========================================
-                    # 第二步：共享記憶體自動發送（如果啟用）
-                    # ========================================
-                    if auto_share_enabled and shared_memory_sender is not None:
-                        try:
-                            # 複製圖像並轉換為 BGR 格式（共享記憶體可能需要 BGR）
-                            image_for_sharing = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-                            
-                            # 執行您需要的預處理
-                            # 目前不執行鏡像翻轉
-                            image_for_sharing = image_for_sharing
-                            
-                            # 發送到共享記憶體
-                            if hasattr(shared_memory_sender, 'trigger_count'):
-                                shared_memory_sender.trigger_count += 1
-                                trigger_count = shared_memory_sender.trigger_count
-                            else:
-                                shared_memory_sender.trigger_count = 1
-                                trigger_count = 1
-                            
-                            shared_memory_sender.send_image(image_for_sharing, trigger_count)
-                            
-                            print(f"[共享記憶體] 已自動發送第 {trigger_count} 幀")
-                            
-                        except Exception as e:
-                            print(f"[共享記憶體] 發送失敗: {e}")
-    
-                    # ========================================
-                    # 第三步：AI 辨識處理（如果啟用）
+                    # 第二步：AI 辨識處理（如果啟用）
                     # ========================================
                     if ai_model is not None and detect_objects is not None:
                         try:
@@ -911,9 +888,8 @@ class CameraOperation:
                                 # ========================================
                                 # 邊界線過濾與 TCP 傳送（不使用觸發系統）
                                 # ========================================
-                                image_height = self.st_frame_info.nHeight
-                                image_width = self.st_frame_info.nWidth
-                                
+                                image_height, image_width = image_rgb.shape[:2]
+
                                 # 計算邊界線的像素位置
                                 top_line_y = int(image_height * boundary_line_top)
                                 bottom_line_y = int(image_height * boundary_line_bottom)
@@ -961,8 +937,7 @@ class CameraOperation:
                             
                             # 計算邊界線位置（如果還沒計算）
                             if 'image_height' not in locals():
-                                image_height = self.st_frame_info.nHeight
-                                image_width = self.st_frame_info.nWidth
+                                image_height, image_width = image_rgb.shape[:2]
                                 top_line_y = int(image_height * boundary_line_top)
                                 bottom_line_y = int(image_height * boundary_line_bottom)
                             
