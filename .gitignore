@@ -8,3 +8,12 @@ __pycache__/
 .gui_language
 *.log
 runs/
+
+# Packaging (see PACKAGING.md)
+.venv-build/
+build/
+dist/
+build_test*/
+license.key
+# The license signing key (see tools/license/new_secret.py). Never commit.
+NIRcam-first/license_secret.py

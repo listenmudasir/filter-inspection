@@ -5,6 +5,32 @@
 from session_log import start_session_log
 start_session_log()
 
+# Checked here too, not just in nircam_launcher.pyw: launching this exe
+# directly (skipping the splash) must not bypass the license check.
+from license_check import enforce_license_or_exit
+enforce_license_or_exit()
+
+from version import VERSION
+
+# MvCameraControl_class loads MvCameraControl.dll by bare name via
+# ctypes.WinDLL at import time. If the vendor's Hikvision MVS runtime isn't
+# on this machine that raises an OSError deep inside an `import *`, which
+# looks like a crash to an operator. Probe for it first and fail with a
+# message box instead.
+# winmode=0, same as MvCameraControl_class.py: Python 3.8+'s default DLL search
+# for a bare name skips PATH, which is where the MVS installer puts its runtime.
+import ctypes as _ctypes
+try:
+    _ctypes.WinDLL("MvCameraControl.dll", winmode=0)
+except OSError:
+    _ctypes.windll.user32.MessageBoxW(
+        None,
+        "找不到 Hikvision MVS 相機驅動（MvCameraControl.dll）。\n"
+        "請先安裝 MVS Runtime 後再啟動本程式，或聯絡窗口協助排除。",
+        "NIRcam Inspection", 0x10)
+    import sys as _sys
+    _sys.exit(1)
+
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import QTimer, QObject, pyqtSignal, Qt
 from PyQt5.QtGui import QImage, QPixmap
@@ -21,12 +47,6 @@ import numpy as np
 import cv2
 from CamOperation_class import set_ai_model, set_ai_parameters_func
 from CamOperation_class import set_manual_image_shape
-from CamOperation_class import (
-    set_boundary_line_positions, 
-    get_boundary_line_positions, 
-    set_boundary_filter_enabled, 
-    is_boundary_filter_enabled
-)
 
 # --- 新增: 用於跨執行緒通訊的訊號發射器 ---
 class SignalEmitter(QObject):
@@ -44,14 +64,17 @@ print("-----------------------------------Entry Yolo-Model-----7 class , materia
 from CamOperation_class import set_ai_model
 set_ai_model(ai_model)
 
-# 觸發來源。CameraOperation.Set_trigger_mode 的預設值是 "Line0"（硬體觸發），
-# 而呼叫端都沒有傳這個參數，於是相機被設成等待 Line0 的硬體脈衝，畫面卻顯示
-# 「軟體觸發模式」並開放軟體觸發按鈕 —— 按下去相機不理會，取流只會一直回
-# 80000007 (MV_E_NODATA)、完全沒有畫面。這裡把來源講明白。
+# 觸發設定以相機為準：開相機時讀出 TriggerMode / TriggerSource（在 MVS 設好的
+# 值，例如 Line0），畫面跟著顯示，不覆寫。原本固定寫入 Software，一開程式就把
+# MVS 設好的 Line0 蓋掉。
 #
-# 產線若是由外部訊號驅動，改用 Line0：
+# 要強制指定來源才設環境變數，例如：
 #     set NIRCAM_TRIGGER_SOURCE=Line0
-TRIGGER_SOURCE = _os.environ.get("NIRCAM_TRIGGER_SOURCE", "Software")
+TRIGGER_SOURCE = _os.environ.get("NIRCAM_TRIGGER_SOURCE") or None
+
+# 相機目前的觸發來源（"Line0"、"Software"…），開相機時讀出。只有 Software
+# 來源時軟體觸發按鈕才有作用，硬體來源下按了相機不會理會。
+trigger_source = None
 
 # 新增全域變數用於控制 AI 檢測參數
 ai_conf_thres = 0.4  # 默認信心指數閾值
@@ -288,7 +311,7 @@ if __name__ == "__main__":
             QMessageBox.warning(mainWindow, "Error", strError, QMessageBox.Ok)
             isOpen = False
         else:
-            set_continue_mode()
+            sync_trigger_mode()
             get_param()
             isOpen = True
             enable_controls()
@@ -333,13 +356,39 @@ if __name__ == "__main__":
             ui.bnSoftwareTrigger.setEnabled(False)
 
     def set_software_trigger_mode():
-        # 一定要指定來源，否則會落到 Set_trigger_mode 的預設 "Line0"，
-        # 相機等硬體脈衝而軟體觸發按鈕完全無效。
+        # 切到觸發模式。沒指定 NIRCAM_TRIGGER_SOURCE 時保留相機現有的來源
+        # （例如 MVS 設的 Line0），不改成 Software。
         ret = obj_cam_operation.Set_trigger_mode(True, source=TRIGGER_SOURCE)
         if ret == 0:
             ui.radioContinueMode.setChecked(False)
             ui.radioTriggerMode.setChecked(True)
-            ui.bnSoftwareTrigger.setEnabled(isGrabbing)
+            ui.bnSoftwareTrigger.setEnabled(isGrabbing and trigger_source == "Software")
+
+    def sync_trigger_mode():
+        """開相機後讓畫面跟相機的觸發設定一致；有設 NIRCAM_TRIGGER_SOURCE 才覆寫相機。
+
+        回傳是否為觸發模式；讀不到相機設定時回傳 None，畫面維持原狀。
+        """
+        global trigger_source
+        if TRIGGER_SOURCE:
+            ret = obj_cam_operation.Set_trigger_mode(True, source=TRIGGER_SOURCE)
+            if ret != 0:
+                print(f"[警告] 套用 NIRCAM_TRIGGER_SOURCE={TRIGGER_SOURCE} 失敗 ({ToHexStr(ret)})")
+
+        is_trigger, trigger_source = obj_cam_operation.Get_trigger_mode()
+        if is_trigger is None:
+            print("[警告] 讀不到相機的觸發設定，畫面上的觸發模式可能與相機不符")
+            return None
+
+        ui.radioContinueMode.setChecked(not is_trigger)
+        ui.radioTriggerMode.setChecked(is_trigger)
+        if is_trigger:
+            print(f"[相機] 觸發模式，觸發來源: {trigger_source}")
+            if trigger_source != "Software":
+                print(f"       等待 {trigger_source} 硬體脈衝；沒有訊號就不會有畫面。")
+        else:
+            print("[相機] 連續取像模式")
+        return is_trigger
 
     def trigger_once():
         ret = obj_cam_operation.Trigger_once()
@@ -451,7 +500,8 @@ if __name__ == "__main__":
         ui.bnClose.setEnabled(isOpen)
         ui.bnStart.setEnabled(isOpen and (not isGrabbing))
         ui.bnStop.setEnabled(isOpen and isGrabbing)
-        ui.bnSoftwareTrigger.setEnabled(isGrabbing and ui.radioTriggerMode.isChecked())
+        ui.bnSoftwareTrigger.setEnabled(isGrabbing and ui.radioTriggerMode.isChecked()
+                                        and trigger_source == "Software")
         ui.bnSaveImage.setEnabled(isOpen and isGrabbing)
 
     # --- 新增: 更新 UI 的槽函式 ---
@@ -496,7 +546,7 @@ if __name__ == "__main__":
     mainWindow = QMainWindow()
     ui = Ui_MainWindow()
     ui.setupUi(mainWindow)
-    mainWindow.setWindowTitle("工業相機 AI 檢測應用 V1.5.3")
+    mainWindow.setWindowTitle(i18n.tr_fmt("工業相機 AI 檢測應用 v{version}", version=VERSION))
 
     # --- 修改 UI 佈局 ---
     
@@ -600,66 +650,6 @@ if __name__ == "__main__":
     
     ai_param_group.setLayout(ai_param_layout)
     control_layout.addWidget(ai_param_group)
-
-    # === 邊界線過濾設定區塊 ===
-    boundary_group = QGroupBox("邊界線過濾設定")
-    boundary_layout = QVBoxLayout()
-    
-    # 啟用/停用邊界線過濾
-    ui.chkBoundaryFilterEnabled = QCheckBox("啟用邊界線過濾")
-    ui.chkBoundaryFilterEnabled.setChecked(True)
-    ui.chkBoundaryFilterEnabled.setStyleSheet("font-weight: bold;")
-    boundary_layout.addWidget(ui.chkBoundaryFilterEnabled)
-    
-    # 上邊界線設定
-    top_line_layout = QHBoxLayout()
-    top_line_layout.addWidget(QLabel("上線:"))
-    ui.sliderTopLine = QSlider(Qt.Horizontal)
-    ui.sliderTopLine.setMinimum(0)
-    ui.sliderTopLine.setMaximum(100)
-    ui.sliderTopLine.setValue(0)
-    top_line_layout.addWidget(ui.sliderTopLine)
-    ui.edtTopLinePercent = QLineEdit("0")
-    ui.edtTopLinePercent.setMaximumWidth(40)
-    top_line_layout.addWidget(ui.edtTopLinePercent)
-    top_line_layout.addWidget(QLabel("%"))
-    ui.lblTopLineColor = QLabel("■")
-    ui.lblTopLineColor.setStyleSheet("color: yellow; font-weight: bold;")
-    top_line_layout.addWidget(ui.lblTopLineColor)
-    boundary_layout.addLayout(top_line_layout)
-    
-    # 下邊界線設定
-    bottom_line_layout = QHBoxLayout()
-    bottom_line_layout.addWidget(QLabel("下線:"))
-    ui.sliderBottomLine = QSlider(Qt.Horizontal)
-    ui.sliderBottomLine.setMinimum(0)
-    ui.sliderBottomLine.setMaximum(100)
-    ui.sliderBottomLine.setValue(100)
-    bottom_line_layout.addWidget(ui.sliderBottomLine)
-    ui.edtBottomLinePercent = QLineEdit("100")
-    ui.edtBottomLinePercent.setMaximumWidth(40)
-    bottom_line_layout.addWidget(ui.edtBottomLinePercent)
-    bottom_line_layout.addWidget(QLabel("%"))
-    ui.lblBottomLineColor = QLabel("■")
-    ui.lblBottomLineColor.setStyleSheet("color: cyan; font-weight: bold;")
-    bottom_line_layout.addWidget(ui.lblBottomLineColor)
-    boundary_layout.addLayout(bottom_line_layout)
-    
-    # 按鈕區域
-    boundary_btn_layout = QHBoxLayout()
-    ui.bnApplyBoundaryLines = QPushButton("套用")
-    ui.bnResetBoundaryLines = QPushButton("重設")
-    boundary_btn_layout.addWidget(ui.bnApplyBoundaryLines)
-    boundary_btn_layout.addWidget(ui.bnResetBoundaryLines)
-    boundary_layout.addLayout(boundary_btn_layout)
-    
-    # 目前邊界線狀態
-    ui.lblBoundaryStatus = QLabel("上線 0%, 下線 100%")
-    ui.lblBoundaryStatus.setStyleSheet("color: blue; font-size: 10px;")
-    boundary_layout.addWidget(ui.lblBoundaryStatus)
-    
-    boundary_group.setLayout(boundary_layout)
-    control_layout.addWidget(boundary_group)
 
     # === TCP 伺服器控制區 ===
     tcp_control_group = QGroupBox("TCP 伺服器控制")
@@ -785,13 +775,6 @@ if __name__ == "__main__":
         # the actual values.
         update_ai_param_display()
         try:
-            ui.lblBoundaryStatus.setText(i18n.tr_fmt(
-                "目前邊界線: 上線 {top}%, 下線 {bottom}%",
-                top=ui.edtTopLinePercent.text(),
-                bottom=ui.edtBottomLinePercent.text()))
-        except (AttributeError, RuntimeError):
-            pass
-        try:
             apply_manual_image_shape()
         except (AttributeError, RuntimeError):
             pass
@@ -823,101 +806,6 @@ if __name__ == "__main__":
     ui.bnUpdateAIParams.clicked.connect(update_ai_parameters)
     ui.bnResetAIParams.clicked.connect(reset_ai_parameters)
 
-    # === 新增 邊界線設定事件處理函數 ===
-    def update_top_line_from_slider():
-        """滑桿更新時同步更新文字框"""
-        value = ui.sliderTopLine.value()
-        ui.edtTopLinePercent.setText(str(value))
-    
-    def update_bottom_line_from_slider():
-        """滑桿更新時同步更新文字框"""
-        value = ui.sliderBottomLine.value()
-        ui.edtBottomLinePercent.setText(str(value))
-    
-    def update_top_line_from_text():
-        """文字框更新時同步更新滑桿"""
-        try:
-            value = int(ui.edtTopLinePercent.text())
-            value = max(0, min(100, value))
-            ui.sliderTopLine.setValue(value)
-        except ValueError:
-            pass
-    
-    def update_bottom_line_from_text():
-        """文字框更新時同步更新滑桿"""
-        try:
-            value = int(ui.edtBottomLinePercent.text())
-            value = max(0, min(100, value))
-            ui.sliderBottomLine.setValue(value)
-        except ValueError:
-            pass
-    
-    def apply_boundary_lines():
-        """套用邊界線設定"""
-        try:
-            top_percent = int(ui.edtTopLinePercent.text())
-            bottom_percent = int(ui.edtBottomLinePercent.text())
-            
-            # 驗證範圍
-            if not (0 <= top_percent <= 100) or not (0 <= bottom_percent <= 100):
-                QMessageBox.warning(mainWindow, "參數錯誤", "邊界線位置必須介於 0 到 100 之間！")
-                return
-            
-            # 驗證上線必須在下線之上
-            if top_percent >= bottom_percent:
-                QMessageBox.warning(mainWindow, "參數錯誤", "上邊界線位置必須小於下邊界線位置！")
-                return
-            
-            # 設定邊界線位置 (轉換為 0.0 ~ 1.0 的比例)
-            set_boundary_line_positions(top_percent / 100.0, bottom_percent / 100.0)
-            
-            # 更新狀態顯示
-            ui.lblBoundaryStatus.setText(i18n.tr_fmt("目前邊界線: 上線 {top}%, 下線 {bottom}%", top=top_percent, bottom=bottom_percent))
-            
-            QMessageBox.information(mainWindow, "邊界線設定", 
-                f"邊界線已更新：\n上邊界線: {top_percent}%\n下邊界線: {bottom_percent}%")
-            
-        except ValueError:
-            QMessageBox.warning(mainWindow, "參數錯誤", "請輸入有效的數值！")
-    
-    def reset_boundary_lines():
-        """重設邊界線為預設值"""
-        ui.sliderTopLine.setValue(0)
-        ui.sliderBottomLine.setValue(100)
-        ui.edtTopLinePercent.setText("0")
-        ui.edtBottomLinePercent.setText("100")
-        set_boundary_line_positions(0.0, 1.0)
-        ui.lblBoundaryStatus.setText(i18n.tr_fmt("目前邊界線: 上線 {top}%, 下線 {bottom}%", top=0, bottom=100))
-        QMessageBox.information(mainWindow, "邊界線設定", "邊界線已重設為預設值：\n上邊界線: 0%\n下邊界線: 100%")
-    
-    def toggle_boundary_filter():
-        """切換邊界線過濾功能"""
-        enabled = ui.chkBoundaryFilterEnabled.isChecked()
-        set_boundary_filter_enabled(enabled)
-        
-        # 更新 UI 狀態
-        ui.sliderTopLine.setEnabled(enabled)
-        ui.sliderBottomLine.setEnabled(enabled)
-        ui.edtTopLinePercent.setEnabled(enabled)
-        ui.edtBottomLinePercent.setEnabled(enabled)
-        ui.bnApplyBoundaryLines.setEnabled(enabled)
-        ui.bnResetBoundaryLines.setEnabled(enabled)
-        
-        if enabled:
-            QMessageBox.information(mainWindow, "邊界線過濾", 
-                "✅ 已啟用邊界線過濾\n\n只有觸碰到邊界線的辨識結果才會傳送給 TCP/IP")
-        else:
-            QMessageBox.information(mainWindow, "邊界線過濾", 
-                "⏸ 已停用邊界線過濾\n\n所有辨識結果都會傳送給 TCP/IP")
-    
-    # 連接邊界線設定事件
-    ui.sliderTopLine.valueChanged.connect(update_top_line_from_slider)
-    ui.sliderBottomLine.valueChanged.connect(update_bottom_line_from_slider)
-    ui.edtTopLinePercent.editingFinished.connect(update_top_line_from_text)
-    ui.edtBottomLinePercent.editingFinished.connect(update_bottom_line_from_text)
-    ui.bnApplyBoundaryLines.clicked.connect(apply_boundary_lines)
-    ui.bnResetBoundaryLines.clicked.connect(reset_boundary_lines)
-    ui.chkBoundaryFilterEnabled.stateChanged.connect(toggle_boundary_filter)
 
     # --- 新增: 連接訊號與槽 ---
     signals.original_image_ready.connect(update_original_display)
@@ -1042,19 +930,10 @@ if __name__ == "__main__":
         isOpen = True
         print(f"[成功] 設備已打開: {devList[0]}")
         
-        # 步驟 3: 設置觸發模式（軟體觸發模式）
-        print("[步驟 3/4] 正在設置觸發模式...")
-        # True = 觸發模式, False = 連續模式。來源必須明講，見 TRIGGER_SOURCE。
-        ret = obj_cam_operation.Set_trigger_mode(True, source=TRIGGER_SOURCE)
-        if ret == 0:
-            ui.radioContinueMode.setChecked(False)
-            ui.radioTriggerMode.setChecked(True)
-            print(f"[成功] 已設置為觸發模式，觸發來源: {TRIGGER_SOURCE}")
-            if TRIGGER_SOURCE != "Software":
-                print(f"       等待 {TRIGGER_SOURCE} 硬體脈衝；沒有訊號就不會有畫面。")
-        else:
-            print(f"[警告] 設置觸發模式失敗 ({ToHexStr(ret)})，保持預設模式")
-        
+        # 步驟 3: 讀取相機的觸發設定（沿用 MVS 的設定，不覆寫）
+        print("[步驟 3/4] 正在讀取觸發模式...")
+        is_trigger = sync_trigger_mode()
+
         # 獲取並設置相機參數
         get_param()
         
@@ -1073,13 +952,18 @@ if __name__ == "__main__":
         
         # 更新 UI 控制狀態
         enable_controls()
-        ui.bnSoftwareTrigger.setEnabled(True)  # 觸發模式下允許軟體觸發
-        
+
+        if is_trigger is None:
+            mode_text = "未知（讀不到相機設定）"
+        elif is_trigger:
+            mode_text = f"觸發模式（來源 {trigger_source}）"
+        else:
+            mode_text = "連續取像模式"
         print("=" * 50)
         print("自動初始化完成！")
         print("  - 設備: " + devList[0])
-        print("  - 模式: 軟體觸發模式")
-        print("  - 狀態: 正在採集，等待觸發信號")
+        print("  - 模式: " + mode_text)
+        print("  - 狀態: 正在採集" + ("，等待觸發信號" if is_trigger else ""))
         print("=" * 50)
         
         return True

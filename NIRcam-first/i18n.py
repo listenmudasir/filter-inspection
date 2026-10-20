@@ -44,7 +44,6 @@ _SETTINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".gui_langu
 _EN = {
     # window / tabs
     "主視窗": "Main Window",
-    "工業相機 AI 檢測應用 V1.5.3": "Industrial Camera AI Inspection V1.5.3",
     "相機控制": "Camera Control",
     "TCP 控制與辨識結果": "TCP Control & Results",
 
@@ -85,14 +84,6 @@ _EN = {
     "更新": "Update",
     "重設": "Reset",
 
-    # boundary filter
-    "邊界線過濾設定": "Boundary Line Filter",
-    "啟用邊界線過濾": "Enable boundary filter",
-    "上線:": "Top:",
-    "下線:": "Bottom:",
-    "套用": "Apply",
-    "上線 25%, 下線 75%": "Top 25%, bottom 75%",
-
     # TCP
     "TCP 伺服器控制": "TCP Server Control",
     "主機:": "Host:",
@@ -123,6 +114,7 @@ _EN = {
 #   tr_fmt("TCP: LabVIEW已連接 (觸發次數: {n})", n=count)
 # so the key stays greppable and the English keeps its placeholders.
 TEMPLATES = {
+    "工業相機 AI 檢測應用 v{version}": "Industrial Camera AI Inspection v{version}",
     "目前參數 - 信心指數: {conf}, 影像大小: {size}":
         "Current - confidence: {conf}, image size: {size}",
     "信心: {conf}, 大小: {size}":
@@ -132,8 +124,6 @@ TEMPLATES = {
     "TCP: 等待LabVIEW連接...": "TCP: waiting for LabVIEW...",
     "TCP: 伺服器未啟動": "TCP: server not started",
     "已覆寫: {width} x {height}": "Overridden: {width} x {height}",
-    "目前邊界線: 上線 {top}%, 下線 {bottom}%":
-        "Boundaries: top {top}%, bottom {bottom}%",
 }
 
 
@@ -220,7 +210,8 @@ def apply_language(main_window=None, tabs=None) -> None:
             _registry.pop(id(widget), None)
 
     if main_window is not None:
-        main_window.setWindowTitle(tr("工業相機 AI 檢測應用 V1.5.3"))
+        from version import VERSION
+        main_window.setWindowTitle(tr_fmt("工業相機 AI 檢測應用 v{version}", version=VERSION))
     if tabs is not None:
         for index, label in enumerate(("相機控制", "TCP 控制與辨識結果")):
             if index < tabs.count():

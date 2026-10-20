@@ -160,14 +160,14 @@ class TCPServer:
             print(f"Error sending detection result: {e}")
             return False
     
-    def send_filtered_detection_result(self, filtered_boxes, image_width, image_height):
-        """發送過濾後的辨識結果到LabVIEW（只包含觸碰邊界線的物件）
-        
+    def send_detection_boxes(self, filtered_boxes, image_width, image_height):
+        """發送一張影像的辨識結果到LabVIEW（每張影像都送；沒有瑕疵時物件數量為 0）
+
         Args:
-            filtered_boxes: list of tuples [(class_id, x1, y1, x2, y2, conf), ...]
+            filtered_boxes: list of tuples [(class_id, x1, y1, x2, y2, conf), ...]，可為空
             image_width: 照片寬度
             image_height: 照片高度
-        
+
         格式: ;,trigger_num,照片寬度,照片高度,物件數量,label1,x1_pixel,y1_pixel,x2_pixel,y2_pixel,...,結尾4個點(0,0,0,0)
         """
         self.trigger_count += 1
@@ -211,13 +211,13 @@ class TCPServer:
             message = ",".join(map(str, message_parts)) + "\n"
             
             if self.send_message(message):
-                print(f"Sent FILTERED to LabVIEW: Trigger {self.trigger_count}, Image({image_width}x{image_height}), {object_count} objects touching boundary lines")
+                print(f"Sent to LabVIEW: Trigger {self.trigger_count}, Image({image_width}x{image_height}), {object_count} objects")
                 # 顯示每個物件的像素座標
                 for i in range(object_count):
                     idx = 5 + i * 5  # 跳過trigger_num, width, height, count
                     label = message_parts[idx]
                     x1, y1, x2, y2 = message_parts[idx+1:idx+5]
-                    print(f"  Object {i+1}: Label={label}, BBox=({x1},{y1})-({x2},{y2}) pixels [觸碰邊界線]")
+                    print(f"  Object {i+1}: Label={label}, BBox=({x1},{y1})-({x2},{y2}) pixels")
                 print(f"Raw message: {message.strip()}")
                 return True
             else:
