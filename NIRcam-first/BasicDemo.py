@@ -934,6 +934,17 @@ if __name__ == "__main__":
 
     # --- 顯示與清理 ---
     mainWindow.show()
+    # GPU 存在但這版 PyTorch 跑不動它（例如 RTX 50 系列配舊版 torch）時，模型會
+    # 改用 CPU。只寫進記錄檔沒人會看到 —— 上次就是相機正常、每一幀都推論失敗、
+    # 完全沒有缺陷被偵測。所以一定要讓操作員看見。
+    _device_warning = getattr(ai_model, "device_warning", None)
+    if _device_warning:
+        QMessageBox.warning(
+            mainWindow, "AI 模型：GPU 無法使用",
+            "顯示卡無法執行目前安裝的 PyTorch，AI 推論已改用 CPU，"
+            "速度會慢很多（每幀數秒）。\n\n"
+            "請重新打包，改用支援此顯示卡的 PyTorch 版本。\n\n"
+            + _device_warning)
     # 設置AI參數函數參考
     set_ai_parameters_func(get_ai_parameters)
     

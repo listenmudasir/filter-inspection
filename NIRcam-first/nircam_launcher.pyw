@@ -93,6 +93,11 @@ def child_environment() -> dict:
         env["PATH"] = mvs + os.pathsep + env.get("PATH", "")
 
     env["PYTHONNOUSERSITE"] = "1"
+    # A redirected stdout otherwise uses the ANSI code page (cp950), and the
+    # log file is opened as UTF-8 -- the Chinese messages came out unreadable.
+    env["PYTHONIOENCODING"] = "utf-8"
+    # The child keeps its own capped log; stop it copying every line into ours.
+    env["NIRCAM_SESSION_LOG_ONLY"] = "1"
     return env
 
 
@@ -135,8 +140,14 @@ class Splash:
 
     def launch(self):
         os.makedirs(LOG_DIR, exist_ok=True)
+        # NOT nircam_YYYYMMDD.log. That name belongs to session_log.py's
+        # RotatingFileHandler inside the child; while this process held the
+        # same file open, Windows refused every rotation past 5 MB and each
+        # refusal was logged into the file it could not rotate -- recursively.
+        # This file only needs what the child prints before session_log is
+        # installed, plus native crashes that bypass Python's sys.stderr.
         self.log_path = os.path.join(
-            LOG_DIR, f"nircam_{_dt.datetime.now():%Y%m%d}.log")
+            LOG_DIR, f"launcher_{_dt.datetime.now():%Y%m%d}.log")
         log = open(self.log_path, "a", encoding="utf-8", buffering=1)
         log.write(f"\n{'=' * 70}\nlaunched "
                   f"{_dt.datetime.now():%Y-%m-%d %H:%M:%S}\n{'=' * 70}\n")

@@ -32,6 +32,9 @@ LOG_DIR_NAME = "logs"
 MAX_BYTES = 5 * 1024 * 1024   # per file
 BACKUP_COUNT = 3              # keep ~20 MB of history in total
 
+# Set by nircam_launcher.pyw: stdout/stderr are its own log file, not a console.
+SESSION_LOG_ONLY_ENV = "NIRCAM_SESSION_LOG_ONLY"
+
 _started = False
 
 
@@ -48,6 +51,7 @@ class TeeStream:
         self._original = original
         self._emit_line = emit_line
         self._pending = ""
+        self._emitting = False
 
     def write(self, text):
         if self._original is not None:
@@ -58,18 +62,33 @@ class TeeStream:
                 # A broken console must never take the acquisition loop down.
                 pass
 
+        # A failing sink reports through logging.Handler.handleError, which
+        # prints "--- Logging error ---" to sys.stderr -- this object. Without
+        # the guard that write calls the sink again, which fails again: one
+        # rollover that Windows refused turned into 290,000 lines of
+        # "--- Logging error ---" and a GUI that never came up.
+        if self._emitting:
+            return len(text)
         self._pending += text
-        while "\n" in self._pending:
-            line, self._pending = self._pending.split("\n", 1)
-            self._emit_line(line)
+        self._emitting = True
+        try:
+            while "\n" in self._pending:
+                line, self._pending = self._pending.split("\n", 1)
+                self._emit_line(line)
+        finally:
+            self._emitting = False
         return len(text)
 
     def flush(self):
         # Emit a trailing partial line so a message that never got its newline
         # (a crash mid-print, say) still reaches the log.
-        if self._pending:
-            self._emit_line(self._pending)
-            self._pending = ""
+        if self._pending and not self._emitting:
+            line, self._pending = self._pending, ""
+            self._emitting = True
+            try:
+                self._emit_line(line)
+            finally:
+                self._emitting = False
         if self._original is not None:
             try:
                 self._original.flush()
@@ -122,8 +141,14 @@ def start_session_log(base_dir=None):
                                            datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(handler)
 
-    sys.stdout = TeeStream(sys.stdout, logger.info)
-    sys.stderr = TeeStream(sys.stderr, logger.info)
+    # Started by nircam_launcher.pyw, the original streams are a file the
+    # launcher holds open, not a console. Forwarding there wrote every line
+    # twice with no size cap -- and when that file was this same log, Windows
+    # refused the rotation because the launcher had it open. Only the console
+    # case is worth forwarding.
+    forward = os.environ.get(SESSION_LOG_ONLY_ENV) != "1"
+    sys.stdout = TeeStream(sys.stdout if forward else None, logger.info)
+    sys.stderr = TeeStream(sys.stderr if forward else None, logger.info)
     _started = True
 
     print("=" * 70)

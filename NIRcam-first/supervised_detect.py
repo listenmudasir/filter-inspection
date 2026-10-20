@@ -272,6 +272,40 @@ class FPNSegmenter(nn.Module):
         return F.interpolate(self.head(merged), size, mode="bilinear", align_corners=False)
 
 
+NO_CUDA = "no CUDA device"
+
+
+def cuda_problem():
+    """None if CUDA can actually execute a kernel, else why not.
+
+    torch.cuda.is_available() only asks the driver whether a GPU exists. It is
+    True on a GPU newer than the torch build -- an RTX 50xx (sm_120) under a
+    cu121/cu124 wheel, which stops at sm_90 -- and the first real kernel then
+    fails with "no kernel image is available for execution on the device".
+    detect_objects() catches that per frame, so the line ran with the camera
+    working and zero detections, ever. Running one tiny kernel up front is the
+    only check that answers the question that matters.
+    """
+    if not torch.cuda.is_available():
+        return NO_CUDA
+    try:
+        probe = torch.ones(16, device="cuda")
+        (probe * 2).sum().item()
+        return None
+    except Exception as exc:
+        try:
+            name = torch.cuda.get_device_name(0)
+            major, minor = torch.cuda.get_device_capability(0)
+            arch = f"sm_{major}{minor}"
+        except Exception:
+            name, arch = "GPU", "?"
+        supported = " ".join(torch.cuda.get_arch_list()) or "?"
+        return (f"{name} ({arch}) is not supported by torch {torch.__version__} "
+                f"(built for: {supported}). Install a torch build that includes "
+                f"{arch} -- for RTX 50xx: torch>=2.7 from the cu128 index. "
+                f"[{type(exc).__name__}: {str(exc).splitlines()[0]}]")
+
+
 class SupervisedDetector:
     """Callable with the same shape as an ultralytics YOLO model object."""
 
@@ -304,8 +338,23 @@ class SupervisedDetector:
                  prob_threshold: float = 0.30, min_area_model_px: int | None = None,
                  border_margin_model_px: int | None = None,
                  min_confidence: float = 0.0, **_legacy):
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Set when the GPU is present but cannot run this torch build; the GUI
+        # shows it to the operator instead of leaving it in the log.
+        self.device_warning = None
+        if device in ("auto", "cuda"):
+            problem = cuda_problem()
+            if problem is None:
+                device = "cuda"
+            else:
+                device = "cpu"
+                if problem != NO_CUDA:
+                    self.device_warning = problem
+                    print("=" * 72)
+                    print("WARNING: the GPU cannot run this PyTorch build -- "
+                          "inference falls back to the CPU (several seconds "
+                          "per frame).")
+                    print(f"  {problem}")
+                    print("=" * 72)
         self.device = torch.device(device)
         self.input_size = int(input_size)
         # 0.30 was selected on the VALIDATION split (F1 0.810 there) and then

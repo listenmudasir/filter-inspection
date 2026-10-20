@@ -145,3 +145,49 @@ def test_log_is_readable_by_windows_default_ansi_tools(tmp_path, monkeypatch):
     assert raw.count(b"\xef\xbb\xbf") == 1
     with open(path, encoding="utf-8-sig") as handle:
         assert "正在執行自動初始化..." in handle.read()
+
+
+def test_tee_does_not_recurse_when_the_sink_reports_through_stderr():
+    # logging's handleError prints to sys.stderr, which is the tee itself.
+    # A sink that fails on every line (a Windows rollover blocked by another
+    # open handle) used to recurse until it filled the disk with
+    # "--- Logging error ---".
+    calls = []
+
+    def failing_sink(line):
+        calls.append(line)
+        tee.write("--- Logging error ---\n")
+
+    original = io.StringIO()
+    tee = TeeStream(original, failing_sink)
+    tee.write("frame 1\n")
+
+    assert calls == ["frame 1"]
+    assert original.getvalue() == "frame 1\n--- Logging error ---\n"
+
+
+def test_launcher_mode_does_not_forward_to_the_original_stream(tmp_path,
+                                                               monkeypatch):
+    # Under nircam_launcher.pyw the original stdout is the launcher's own log
+    # file; copying every line there doubled the logging with no size cap.
+    import session_log
+
+    monkeypatch.setattr(session_log, "_started", False)
+    monkeypatch.setenv(session_log.SESSION_LOG_ONLY_ENV, "1")
+    launcher_file = io.StringIO()
+    real_stdout, real_stderr = session_log.sys.stdout, session_log.sys.stderr
+    session_log.sys.stdout = launcher_file
+    try:
+        path = start_session_log(str(tmp_path))
+        print("only in the session log")
+        session_log.sys.stdout.flush()
+    finally:
+        session_log.sys.stdout, session_log.sys.stderr = real_stdout, real_stderr
+        logger = session_log.logging.getLogger("nircam.console")
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+
+    assert launcher_file.getvalue() == ""
+    with open(path, encoding="utf-8-sig") as handle:
+        assert "only in the session log" in handle.read()
