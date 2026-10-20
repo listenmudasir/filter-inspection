@@ -4,6 +4,13 @@
 #   pip install torch==2.5.1 torchvision==0.20.1 \
 #       --index-url https://download.pytorch.org/whl/cu121
 #
+# RTX 50xx (Blackwell, sm_120) is NOT covered by cu121/cu124 builds: CUDA reports
+# available, every kernel then fails with "no kernel image is available", and the
+# GUI falls back to CPU. Those GPUs need torch>=2.7 built for CUDA 12.8:
+#   pip install torch==2.7.1 torchvision==0.22.1 \
+#       --index-url https://download.pytorch.org/whl/cu128
+# `python selftest.py` checks this ("CUDA kernels run on this GPU").
+#
 # CPU-only works but the forward pass goes from ~45 ms to seconds and will NOT
 # meet the per-cartridge budget.
 

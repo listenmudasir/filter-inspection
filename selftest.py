@@ -66,6 +66,18 @@ try:
     check("CUDA available", torch.cuda.is_available(),
           torch.cuda.get_device_name(0) if torch.cuda.is_available()
           else "CPU only -- will NOT meet the per-cartridge budget", fatal=False)
+    if torch.cuda.is_available():
+        # is_available() is True even when this torch build has no kernels for
+        # the GPU (RTX 50xx / sm_120 under a cu121 wheel). Run one.
+        try:
+            torch.ones(16, device="cuda").sum().item()
+            check("CUDA kernels run on this GPU", True)
+        except Exception as exc:
+            major, minor = torch.cuda.get_device_capability(0)
+            check("CUDA kernels run on this GPU", False,
+                  f"sm_{major}{minor} not in torch {torch.__version__} "
+                  f"({' '.join(torch.cuda.get_arch_list())}); RTX 50xx needs "
+                  f"torch>=2.7 from the cu128 index -- {str(exc).splitlines()[0]}")
 except ImportError:
     check("torch importable", False)
 
